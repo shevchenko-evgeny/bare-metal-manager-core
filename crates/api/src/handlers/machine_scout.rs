@@ -299,7 +299,7 @@ pub(crate) async fn reboot_completed(
         .load_machine(&machine_id, MachineSearchConfig::default())
         .await?;
 
-    api.metrics.record_restart_time(&machine);
+    api.metrics.record_reboot_duration(&machine);
 
     db::machine::update_reboot_time(&machine, &mut txn).await?;
 

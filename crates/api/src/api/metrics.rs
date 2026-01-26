@@ -15,37 +15,37 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Histogram, Meter};
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, InstrumentKind, Stream, View};
 
-/// Metric name for machine restart time histogram
-pub const MACHINE_RESTART_TIME_METRIC_NAME: &str = "forge_machine_restart_time_seconds";
+/// Metric name for machine reboot duration histogram
+pub const MACHINE_REBOOT_DURATION_METRIC_NAME: &str = "forge_machine_reboot_duration_seconds";
 
 /// Holds all metrics related to the API service
 pub struct ApiMetrics {
-    pub machine_restart_time_histogram: Histogram<u64>,
+    pub machine_reboot_duration_histogram: Histogram<u64>,
 }
 
 impl ApiMetrics {
     /// Creates a new ApiMetrics instance with all metrics initialized
     pub fn new(meter: &Meter) -> Self {
-        let machine_restart_time_histogram = meter
-            .u64_histogram(MACHINE_RESTART_TIME_METRIC_NAME)
-            .with_description("Time taken for machine/host to restart in seconds")
+        let machine_reboot_duration_histogram = meter
+            .u64_histogram(MACHINE_REBOOT_DURATION_METRIC_NAME)
+            .with_description("Time taken for machine/host to reboot in seconds")
             .with_unit("s")
             .build();
 
         Self {
-            machine_restart_time_histogram,
+            machine_reboot_duration_histogram,
         }
     }
 
-    /// Creates histogram bucket configuration for machine restart time
+    /// Creates histogram bucket configuration for machine reboot duration
     ///
-    /// Machine restarts typically take 5-20 minutes (300-1200 seconds).
-    /// Buckets are optimized for this range with additional buckets for faster/slower restarts.
+    /// Machine reboots typically take 5-20 minutes (300-1200 seconds).
+    /// Buckets are optimized for this range with additional buckets for faster/slower reboots.
     ///
     /// Boundaries in seconds: 1min, 2min, 3min, 5min, 7min, 10min, 15min, 20min, 30min, 45min, 60min
-    pub fn machine_restart_time_view()
+    pub fn machine_reboot_duration_view()
     -> Result<Box<dyn View>, opentelemetry_sdk::metrics::MetricError> {
-        let mut criteria = Instrument::new().name(MACHINE_RESTART_TIME_METRIC_NAME.to_string());
+        let mut criteria = Instrument::new().name(MACHINE_REBOOT_DURATION_METRIC_NAME.to_string());
         criteria.kind = Some(InstrumentKind::Histogram);
         let mask = Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
             boundaries: vec![
@@ -56,8 +56,8 @@ impl ApiMetrics {
         opentelemetry_sdk::metrics::new_view(criteria, mask)
     }
 
-    /// Records the machine restart time metric with product information
-    pub fn record_restart_time(&self, machine: &model::machine::Machine) {
+    /// Records the machine reboot duration metric with product information
+    pub fn record_reboot_duration(&self, machine: &model::machine::Machine) {
         let Some(last_reboot_requested) = &machine.last_reboot_requested else {
             return;
         };
@@ -70,10 +70,10 @@ impl ApiMetrics {
             return;
         }
 
-        let restart_duration_secs = (chrono::Utc::now() - last_reboot_requested.time).num_seconds();
+        let reboot_duration_secs = (chrono::Utc::now() - last_reboot_requested.time).num_seconds();
 
         // Only record positive durations (in case of clock skew)
-        if restart_duration_secs <= 0 {
+        if reboot_duration_secs <= 0 {
             return;
         }
 
@@ -99,7 +99,7 @@ impl ApiMetrics {
             KeyValue::new("reboot_mode", last_reboot_requested.mode.to_string()),
         ];
 
-        self.machine_restart_time_histogram
-            .record(restart_duration_secs as u64, &attributes);
+        self.machine_reboot_duration_histogram
+            .record(reboot_duration_secs as u64, &attributes);
     }
 }
