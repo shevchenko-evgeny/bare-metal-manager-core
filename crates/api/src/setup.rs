@@ -37,7 +37,7 @@ use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::{Semaphore, oneshot};
 use tracing_log::AsLog as _;
 
-use crate::api::{Api, ApiBuilder};
+use crate::api::Api;
 use crate::cfg::file::{CarbideConfig, ListenMode};
 use crate::dpa::DpaInfo;
 use crate::dynamic_settings::DynamicSettings;
@@ -360,24 +360,22 @@ pub async fn start_api(
 
     let shared_nmxm_pool: Arc<dyn NmxmClientPool> = Arc::new(nmxm_pool);
 
-    let api_service = Arc::new(
-        ApiBuilder::new(
-            db_pool,
-            vault_client.clone(),
-            vault_client,
-            shared_redfish_pool,
-            eth_data,
-            common_pools,
-            ib_fabric_manager,
-            carbide_config.clone(),
-            dynamic_settings,
-            bmc_explorer,
-            shared_nmxm_pool,
-            work_lock_manager_handle,
-        )
-        .with_rms_client(rms_client.clone())
-        .build(&meter),
-    );
+    let api_service = Arc::new(Api::new(
+        db_pool,
+        vault_client.clone(),
+        vault_client,
+        shared_redfish_pool,
+        eth_data,
+        common_pools,
+        ib_fabric_manager,
+        carbide_config.clone(),
+        dynamic_settings,
+        bmc_explorer,
+        shared_nmxm_pool,
+        work_lock_manager_handle,
+        rms_client.clone(),
+        &meter,
+    ));
 
     let (controllers_stop_tx, controllers_stop_rx) = oneshot::channel();
     let controllers_handle = if carbide_config.listen_only {

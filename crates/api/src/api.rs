@@ -10,7 +10,6 @@
  * its affiliates is strictly prohibited.
  */
 
-pub mod builder;
 mod metrics;
 
 use std::collections::HashMap;
@@ -18,7 +17,6 @@ use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub use self::builder::ApiBuilder;
 pub use self::metrics::ApiMetrics;
 pub use ::rpc::forge as rpc;
 use ::rpc::forge::{RemoveSkuRequest, SkuIdList};
@@ -3061,6 +3059,46 @@ impl TransactionVending for PgPool {
 }
 
 impl Api {
+    /// Creates a new Api instance with all dependencies
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        database_connection: sqlx::PgPool,
+        credential_provider: Arc<dyn CredentialProvider>,
+        certificate_provider: Arc<dyn CertificateProvider>,
+        redfish_pool: Arc<dyn RedfishClientPool>,
+        eth_data: EthVirtData,
+        common_pools: Arc<CommonPools>,
+        ib_fabric_manager: Arc<dyn IBFabricManager>,
+        runtime_config: Arc<CarbideConfig>,
+        dynamic_settings: DynamicSettings,
+        endpoint_explorer: Arc<dyn EndpointExplorer>,
+        nmxm_pool: Arc<dyn NmxmClientPool>,
+        work_lock_manager_handle: WorkLockManagerHandle,
+        rms_client: Option<Arc<Box<dyn RmsApi>>>,
+        meter: &opentelemetry::metrics::Meter,
+    ) -> Self {
+        let metrics = ApiMetrics::new(meter);
+
+        Self {
+            database_connection,
+            credential_provider,
+            certificate_provider,
+            redfish_pool,
+            eth_data,
+            common_pools,
+            ib_fabric_manager,
+            runtime_config,
+            dpu_health_log_limiter: LogLimiter::default(),
+            dynamic_settings,
+            endpoint_explorer,
+            scout_stream_registry: ConnectionRegistry::new(),
+            rms_client,
+            nmxm_pool,
+            work_lock_manager_handle,
+            metrics,
+        }
+    }
+
     // This function can just async when
     // https://github.com/rust-lang/rust/issues/110011 will be
     // implemented
