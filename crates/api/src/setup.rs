@@ -361,19 +361,19 @@ pub async fn start_api(
     let shared_nmxm_pool: Arc<dyn NmxmClientPool> = Arc::new(nmxm_pool);
 
     let api_service = Arc::new(Api::new(
-        db_pool,
         vault_client.clone(),
-        vault_client,
-        shared_redfish_pool,
-        eth_data,
         common_pools,
-        ib_fabric_manager,
-        carbide_config.clone(),
+        vault_client,
+        db_pool,
         dynamic_settings,
         bmc_explorer,
+        eth_data,
+        ib_fabric_manager,
+        shared_redfish_pool,
+        carbide_config.clone(),
+        rms_client.clone(),
         shared_nmxm_pool,
         work_lock_manager_handle,
-        rms_client.clone(),
         &meter,
     ));
 

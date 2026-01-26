@@ -3062,19 +3062,19 @@ impl Api {
     /// Creates a new Api instance with all dependencies
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        database_connection: sqlx::PgPool,
-        credential_provider: Arc<dyn CredentialProvider>,
         certificate_provider: Arc<dyn CertificateProvider>,
-        redfish_pool: Arc<dyn RedfishClientPool>,
-        eth_data: EthVirtData,
         common_pools: Arc<CommonPools>,
-        ib_fabric_manager: Arc<dyn IBFabricManager>,
-        runtime_config: Arc<CarbideConfig>,
+        credential_provider: Arc<dyn CredentialProvider>,
+        database_connection: sqlx::PgPool,
         dynamic_settings: DynamicSettings,
         endpoint_explorer: Arc<dyn EndpointExplorer>,
+        eth_data: EthVirtData,
+        ib_fabric_manager: Arc<dyn IBFabricManager>,
+        redfish_pool: Arc<dyn RedfishClientPool>,
+        runtime_config: Arc<CarbideConfig>,
+        rms_client: Option<Arc<Box<dyn RmsApi>>>,
         nmxm_pool: Arc<dyn NmxmClientPool>,
         work_lock_manager_handle: WorkLockManagerHandle,
-        rms_client: Option<Arc<Box<dyn RmsApi>>>,
         meter: &opentelemetry::metrics::Meter,
     ) -> Self {
         let metrics = ApiMetrics::new(meter);

@@ -1306,19 +1306,19 @@ pub async fn create_test_env_with_overrides(
     let rms_sim = Arc::new(RmsSim);
 
     let api = Arc::new(Api::new(
-        db_pool.clone(),
-        credential_provider.clone(),
         certificate_provider.clone(),
-        redfish_sim.clone(),
-        eth_virt_data.clone(),
         common_pools.clone(),
-        ib_fabric_manager.clone(),
-        config.clone(),
+        credential_provider.clone(),
+        db_pool.clone(),
         dyn_settings,
         bmc_explorer,
+        eth_virt_data.clone(),
+        ib_fabric_manager.clone(),
+        redfish_sim.clone(),
+        config.clone(),
+        rms_sim.as_rms_client(),
         nmxm_sim.clone(),
         work_lock_manager_handle.clone(),
-        rms_sim.as_rms_client(),
         &test_meter.meter(),
     ));
 
