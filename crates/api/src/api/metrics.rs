@@ -57,7 +57,7 @@ impl ApiMetrics {
     }
 
     /// Records the machine restart time metric with product information
-    pub fn record_restart_time_metric(&self, machine: &model::machine::Machine) {
+    pub fn record_restart_time(&self, machine: &model::machine::Machine) {
         let Some(last_reboot_requested) = &machine.last_reboot_requested else {
             return;
         };
