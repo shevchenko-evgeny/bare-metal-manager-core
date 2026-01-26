@@ -1321,6 +1321,7 @@ pub async fn create_test_env_with_overrides(
         rms_client: rms_sim.as_rms_client(),
         nmxm_pool: nmxm_sim.clone(),
         work_lock_manager_handle: work_lock_manager_handle.clone(),
+        meter: test_meter.meter(),
     });
 
     let attestation_enabled = config.attestation_enabled;

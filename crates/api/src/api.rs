@@ -15,6 +15,7 @@ use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use opentelemetry::metrics::Meter;
 pub use ::rpc::forge as rpc;
 use ::rpc::forge::{RemoveSkuRequest, SkuIdList};
 use ::rpc::protos::dns::{
@@ -66,6 +67,7 @@ pub struct Api {
     pub(crate) rms_client: Option<Arc<Box<dyn RmsApi>>>,
     pub(crate) nmxm_pool: Arc<dyn NmxmClientPool>,
     pub(crate) work_lock_manager_handle: WorkLockManagerHandle,
+    pub(crate) meter: Meter,
 }
 
 pub(crate) type ScoutStreamType =
