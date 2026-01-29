@@ -10,6 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +24,9 @@ use model::expected_machine::ExpectedMachine;
 use model::expected_power_shelf::ExpectedPowerShelf;
 use model::expected_switch::ExpectedSwitch;
 use model::machine::MachineInterfaceSnapshot;
-use model::site_explorer::{EndpointExplorationError, EndpointExplorationReport, LockdownStatus};
+use model::site_explorer::{
+    EndpointExplorationError, EndpointExplorationReport, ExplorationComponent, LockdownStatus,
+};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -47,7 +50,7 @@ pub struct BmcEndpointExplorer {
     credential_client: CredentialClient,
     mutex: Arc<Mutex<()>>,
     rotate_switch_nvos_credentials: Arc<AtomicBool>,
-    firmware_inventory_cache_interval: ChronoDuration,
+    cache_intervals: HashMap<ExplorationComponent, ChronoDuration>,
 }
 
 impl BmcEndpointExplorer {
@@ -56,7 +59,7 @@ impl BmcEndpointExplorer {
         ipmi_tool: Arc<dyn IPMITool>,
         credential_provider: Arc<dyn CredentialProvider>,
         rotate_switch_nvos_credentials: Arc<AtomicBool>,
-        firmware_inventory_cache_interval: ChronoDuration,
+        cache_intervals: HashMap<ExplorationComponent, ChronoDuration>,
     ) -> Self {
         Self {
             redfish_client: RedfishClient::new(redfish_client_pool),
@@ -64,7 +67,7 @@ impl BmcEndpointExplorer {
             credential_client: CredentialClient::new(credential_provider),
             mutex: Arc::new(Mutex::new(())),
             rotate_switch_nvos_credentials,
-            firmware_inventory_cache_interval,
+            cache_intervals,
         }
     }
 
@@ -158,7 +161,8 @@ impl BmcEndpointExplorer {
         credentials: Credentials,
         boot_interface_mac: Option<MacAddress>,
         previous_report: Option<&EndpointExplorationReport>,
-        firmware_inventory_cache_interval: ChronoDuration,
+        cache_intervals: &HashMap<ExplorationComponent, ChronoDuration>,
+        exploration_requested: bool,
     ) -> Result<EndpointExplorationReport, EndpointExplorationError> {
         self.redfish_client
             .generate_exploration_report(
@@ -166,7 +170,8 @@ impl BmcEndpointExplorer {
                 credentials,
                 boot_interface_mac,
                 previous_report,
-                firmware_inventory_cache_interval,
+                cache_intervals,
+                exploration_requested,
             )
             .await
     }
@@ -265,7 +270,8 @@ impl BmcEndpointExplorer {
             bmc_credentials,
             None,
             None,
-            self.firmware_inventory_cache_interval,
+            &self.cache_intervals,
+            true, // exploration_requested: fresh data after credential change
         )
         .await
     }
@@ -649,6 +655,7 @@ impl EndpointExplorer for BmcEndpointExplorer {
         expected_switch: Option<ExpectedSwitch>,
         last_report: Option<&EndpointExplorationReport>,
         boot_interface_mac: Option<MacAddress>,
+        exploration_requested: bool,
     ) -> Result<EndpointExplorationReport, EndpointExplorationError> {
         // If the site explorer was previously unable to login to the root BMC account using
         // the expected credentials, wait for an operator to manually intervene.
@@ -697,7 +704,8 @@ impl EndpointExplorer for BmcEndpointExplorer {
                         credentials,
                         boot_interface_mac,
                         last_report,
-                        self.firmware_inventory_cache_interval,
+                        &self.cache_intervals,
+                        exploration_requested,
                     )
                     .await
                 {

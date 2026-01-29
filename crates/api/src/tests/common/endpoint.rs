@@ -109,7 +109,7 @@ fn build_exploration_report(
                 release_date: None,
             }],
         }],
-        last_firmware_inventory_fetch: None,
+        component_fetch_times: HashMap::new(),
         machine_id,
         versions: HashMap::default(),
         model: None,

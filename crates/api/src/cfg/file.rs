@@ -40,7 +40,7 @@ use model::machine::HostHealthConfig;
 use model::network_security_group::NetworkSecurityGroupRule;
 use model::network_segment::NetworkDefinition;
 use model::resource_pool::define::ResourcePoolDef;
-use model::site_explorer::{EndpointExplorationReport, ExploredEndpoint};
+use model::site_explorer::{EndpointExplorationReport, ExplorationComponent, ExploredEndpoint};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utils::HostPortPair;
@@ -48,6 +48,23 @@ use utils::HostPortPair;
 use crate::state_controller::config::IterationConfig;
 
 const MAX_IB_PARTITION_PER_TENANT: i32 = 31;
+
+/// Deserialize a HashMap where values are duration strings like "12h", "30m", etc.
+fn deserialize_cache_intervals<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<ExplorationComponent, Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let map: HashMap<ExplorationComponent, String> = HashMap::deserialize(deserializer)?;
+    map.into_iter()
+        .map(|(k, v)| {
+            duration_str::parse_chrono(&v)
+                .map(|d| (k, d))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
 
 static BF2_NIC: &str = "24.47.1026";
 static BF2_BMC: &str = "BF-25.10-9";
@@ -1206,15 +1223,12 @@ pub struct SiteExplorerConfig {
     /// Default is 1 hour.
     pub reset_rate_limit: Duration,
 
-    #[serde(
-        default = "SiteExplorerConfig::default_firmware_inventory_cache_interval",
-        deserialize_with = "deserialize_duration_chrono",
-        serialize_with = "as_duration"
-    )]
-    /// Interval to cache firmware inventory.
-    /// When set, firmware inventory from the previous report is reused if fetched
-    /// within this interval. Default: 12 hours.
-    pub firmware_inventory_cache_interval: Duration,
+    /// Cache intervals for exploration components.
+    /// When set, component data from the previous report is reused if fetched
+    /// within the configured interval. Default: empty (no caching).
+    /// Example: `{ firmware_inventory = "12h", systems = "1h" }`
+    #[serde(default, deserialize_with = "deserialize_cache_intervals")]
+    pub cache_intervals: HashMap<ExplorationComponent, Duration>,
 
     #[serde(
         default = "SiteExplorerConfig::default_admin_segment_type_non_dpu",
@@ -1289,7 +1303,7 @@ impl Default for SiteExplorerConfig {
             bmc_proxy: crate::dynamic_settings::bmc_proxy(None),
             allow_changing_bmc_proxy: None,
             reset_rate_limit: Self::default_reset_rate_limit(),
-            firmware_inventory_cache_interval: Self::default_firmware_inventory_cache_interval(),
+            cache_intervals: HashMap::new(),
             admin_segment_type_non_dpu: Self::default_admin_segment_type_non_dpu(),
             allocate_secondary_vtep_ip: false,
             create_power_shelves: Arc::new(true.into()),
@@ -1343,10 +1357,6 @@ impl SiteExplorerConfig {
 
     pub const fn default_reset_rate_limit() -> Duration {
         Duration::hours(1)
-    }
-
-    pub const fn default_firmware_inventory_cache_interval() -> Duration {
-        Duration::hours(12)
     }
 
     pub fn default_admin_segment_type_non_dpu() -> Arc<AtomicBool> {
@@ -2894,7 +2904,7 @@ mod tests {
                 bmc_proxy: crate::dynamic_settings::bmc_proxy(None),
                 allow_changing_bmc_proxy: None,
                 reset_rate_limit: Duration::hours(1),
-                firmware_inventory_cache_interval: Duration::hours(12),
+                cache_intervals: HashMap::new(),
                 admin_segment_type_non_dpu: Arc::new(false.into()),
                 allocate_secondary_vtep_ip: false,
                 create_power_shelves: Arc::new(true.into()),
@@ -3057,7 +3067,14 @@ mod tests {
                 bmc_proxy: crate::dynamic_settings::bmc_proxy(None),
                 allow_changing_bmc_proxy: None,
                 reset_rate_limit: Duration::hours(2),
-                firmware_inventory_cache_interval: Duration::hours(12),
+                cache_intervals: [
+                    (ExplorationComponent::FirmwareInventory, Duration::hours(12)),
+                    (ExplorationComponent::Managers, Duration::minutes(30)),
+                    (ExplorationComponent::Systems, Duration::hours(1)),
+                    (ExplorationComponent::Chassis, Duration::hours(2)),
+                ]
+                .into_iter()
+                .collect(),
                 admin_segment_type_non_dpu: Arc::new(false.into()),
                 allocate_secondary_vtep_ip: false,
                 create_power_shelves: Arc::new(true.into()),
@@ -3324,7 +3341,7 @@ mod tests {
                 bmc_proxy: crate::dynamic_settings::bmc_proxy(None),
                 allow_changing_bmc_proxy: None,
                 reset_rate_limit: Duration::hours(2),
-                firmware_inventory_cache_interval: Duration::hours(12),
+                cache_intervals: HashMap::new(),
                 admin_segment_type_non_dpu: Arc::new(false.into()),
                 allocate_secondary_vtep_ip: false,
                 create_power_shelves: Arc::new(true.into()),
