@@ -1578,7 +1578,7 @@ impl TestRackDbBuilder {
     pub fn with_expected_compute_trays(mut self, expected_compute_trays: Vec<[u8; 6]>) -> Self {
         self.expected_compute_trays = expected_compute_trays
             .into_iter()
-            .map(|i| MacAddress::new(i))
+            .map(MacAddress::new)
             .collect();
         self
     }
@@ -1586,7 +1586,7 @@ impl TestRackDbBuilder {
     pub fn with_expected_power_shelves(mut self, expected_power_shelves: Vec<[u8; 6]>) -> Self {
         self.expected_power_shelves = expected_power_shelves
             .into_iter()
-            .map(|i| MacAddress::new(i))
+            .map(MacAddress::new)
             .collect();
         self
     }
@@ -1594,7 +1594,7 @@ impl TestRackDbBuilder {
     pub fn with_expected_switches(mut self, expected_switches: Vec<[u8; 6]>) -> Self {
         self.expected_switches = expected_switches
             .into_iter()
-            .map(|i| MacAddress::new(i))
+            .map(MacAddress::new)
             .collect();
         self
     }
@@ -1615,7 +1615,7 @@ impl TestRackDbBuilder {
         )
         .await?;
 
-        if self.compute_trays.len() > 0 || self.power_shelves.len() > 0 {
+        if !self.compute_trays.is_empty() || !self.power_shelves.is_empty() {
             let cfg = RackConfig {
                 compute_trays: self.compute_trays.clone(),
                 power_shelves: self.power_shelves.clone(),

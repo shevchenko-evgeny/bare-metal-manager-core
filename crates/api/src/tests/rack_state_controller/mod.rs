@@ -74,25 +74,22 @@ impl StateHandler for TestRackStateHandler {
 
         let new_state = match controller_state {
             RackState::Expected => {
-                let new_state = &RackState::Discovering;
-                new_state
+                &RackState::Discovering
             }
 
             RackState::Discovering => {
-                let new_state = &RackState::Ready {
+                &RackState::Ready {
                     rack_ready: RackReadyState::Partial,
-                };
-                new_state
+                }
             }
 
             RackState::Ready {
                 rack_ready: ready_state,
             } => match ready_state {
                 RackReadyState::Partial => {
-                    let new_state = &RackState::Ready {
+                    &RackState::Ready {
                         rack_ready: RackReadyState::Full,
-                    };
-                    new_state
+                    }
                 }
                 RackReadyState::Full => {
                     return Ok(StateHandlerOutcome::transition(RackState::Maintenance {
@@ -111,12 +108,12 @@ impl StateHandler for TestRackStateHandler {
 
         let mut txn = ctx.services.db_pool.begin().await?;
 
-        db_rack::try_update_controller_state(&mut txn, rack_id, old_version, &new_state).await?;
+        db_rack::try_update_controller_state(&mut txn, rack_id, old_version, new_state).await?;
 
         // Persist state history so we can get at it from UT
         rack_state_history::persist(
             &mut txn,
-            &rack_id,
+            rack_id,
             &controller_state.clone(),
             old_version,
         )
@@ -127,7 +124,7 @@ impl StateHandler for TestRackStateHandler {
     }
 }
 
-fn validate_state_change_history(histories: &Vec<RackStateHistoryRecord>, expected: &Vec<&str>) -> bool {
+fn validate_state_change_history(histories: &[RackStateHistoryRecord], expected: &Vec<&str>) -> bool {
     for &s in expected {
         if !histories.iter().any(|e| e.state == s) {
             return false;
