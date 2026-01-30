@@ -28,7 +28,7 @@ use db::rack as db_rack;
 use config_version::ConfigVersion;
 use db::rack_state_history;
 use model::rack::{Rack, RackMaintenanceState, RackReadyState, RackState, RackValidationState};
-use rpc::forge::RackEvent;
+use rpc::forge::RackStateHistoryRecord;
 use rpc::forge::forge_server::Forge;
 use crate::state_controller::config::IterationConfig;
 use crate::state_controller::controller::StateController;
@@ -127,9 +127,9 @@ impl StateHandler for TestRackStateHandler {
     }
 }
 
-fn validate_state_change_history(histories: &Vec<RackEvent>, expected: &Vec<&str>) -> bool {
+fn validate_state_change_history(histories: &Vec<RackStateHistoryRecord>, expected: &Vec<&str>) -> bool {
     for &s in expected {
-        if !histories.iter().any(|e| e.event == s) {
+        if !histories.iter().any(|e| e.state == s) {
             return false;
         }
     }

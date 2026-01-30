@@ -241,10 +241,10 @@ pub fn state_sla(state: &RackState, state_version: &ConfigVersion) -> StateSla {
     }
 }
 
-impl From<RackStateHistory> for rpc::forge::RackEvent {
-    fn from(value: RackStateHistory) -> rpc::forge::RackEvent {
-        rpc::forge::RackEvent {
-            event: value.state,
+impl From<RackStateHistory> for rpc::forge::RackStateHistoryRecord {
+    fn from(value: RackStateHistory) -> rpc::forge::RackStateHistoryRecord {
+        rpc::forge::RackStateHistoryRecord {
+            state: value.state,
             version: value.state_version.version_string(),
             time: Some(value.state_version.timestamp().into()),
         }

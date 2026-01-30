@@ -5660,8 +5660,8 @@ message Rack {
   google.protobuf.Timestamp deleted = 11;
 }
 
-message RackEvent {
-  string event = 1;
+message RackStateHistoryRecord {
+  string state = 1;
   string version = 2;
   google.protobuf.Timestamp time = 3;
 }
@@ -5675,7 +5675,7 @@ message RackStateHistories {
 }
 
 message RackStateHistoryRecords {
-  repeated RackEvent records = 1;
+  repeated RackStateHistoryRecord records = 1;
 }
 
 message DeleteRackRequest {
