@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::iter;
 use std::net::IpAddr;
+use sqlx::PgConnection;
 
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::power_shelf::{PowerShelfId, PowerShelfIdSource, PowerShelfType};
@@ -1536,7 +1537,7 @@ pub async fn new_power_shelfs(env: &TestEnv, count: u32) -> eyre::Result<Vec<Pow
 
 #[allow(dead_code)]
 #[derive(Default)]
-pub struct TestRackBuilder {
+pub struct TestRackDbBuilder {
     compute_trays: Vec<MachineId>,
     power_shelves: Vec<PowerShelfId>,
     switches: Vec<SwitchId>,
@@ -1547,9 +1548,9 @@ pub struct TestRackBuilder {
 }
 
 #[allow(dead_code)]
-impl TestRackBuilder {
-    pub fn new() -> TestRackBuilder {
-        TestRackBuilder {
+impl TestRackDbBuilder {
+    pub fn new() -> TestRackDbBuilder {
+        TestRackDbBuilder {
             ..Default::default()
         }
     }
@@ -1598,8 +1599,7 @@ impl TestRackBuilder {
         self
     }
 
-    pub async fn build(&self, env: &TestEnv) -> Result<String, DatabaseError> {
-        let mut txn = env.pool.begin().await.unwrap();
+    pub async fn persist(&self, txn: &mut PgConnection) -> Result<String, DatabaseError> {
         // TODO: this should be RackId. See JIRA RACKMANAGER-377
         let rack_id = self
             .rack_id
@@ -1607,7 +1607,7 @@ impl TestRackBuilder {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         db_rack::create(
-            &mut txn,
+            txn,
             &rack_id,
             self.expected_compute_trays.clone(),
             self.expected_switches.clone(),
@@ -1623,10 +1623,8 @@ impl TestRackBuilder {
                 expected_power_shelves: self.expected_power_shelves.clone(),
             };
 
-            db_rack::update(&mut txn, &rack_id, &cfg).await?;
+            db_rack::update(txn, &rack_id, &cfg).await?;
         }
-
-        txn.commit().await.unwrap();
 
         Ok(rack_id)
     }

@@ -39,7 +39,7 @@ use crate::state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
     StateHandlerOutcomeWithTransaction,
 };
-use crate::tests::common::api_fixtures::{create_test_env, site_explorer::TestRackBuilder};
+use crate::tests::common::api_fixtures::{create_test_env, site_explorer::TestRackDbBuilder};
 
 mod fixtures;
 use fixtures::rack::{mark_rack_as_deleted, set_rack_controller_state};
@@ -113,11 +113,10 @@ impl StateHandler for TestRackStateHandler {
 
         let mut txn = ctx.services.db_pool.begin().await?;
 
-        let _updated =
-            db_rack::try_update_controller_state(&mut txn, rack_id, old_version, &new_state).await?;
+        db_rack::try_update_controller_state(&mut txn, rack_id, old_version, &new_state).await?;
 
         // Persist state history so we can get at it from UT
-        let _history = rack_state_history::persist(
+        rack_state_history::persist(
             &mut txn,
             &rack_id,
             &controller_state.clone(),
@@ -146,8 +145,8 @@ async fn test_can_retrieve_rack_state_history(
     let env = create_test_env(pool.clone()).await;
 
     // Create a rack
-     let mut txn = pool.acquire().await?;
-    let rack_id = TestRackBuilder::new()
+    let mut txn = pool.acquire().await?;
+    let rack_id = TestRackDbBuilder::new()
         .with_expected_compute_trays(vec![
             [0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x50],
             [0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x51],
@@ -156,11 +155,11 @@ async fn test_can_retrieve_rack_state_history(
             [0x01, 0x1A, 0x2B, 0x3C, 0x4D, 0x50],
             [0x01, 0x1A, 0x2B, 0x3C, 0x4D, 0x51],
         ])
-        .build(&env)
+        .persist(&mut txn)
         .await?;
 
     // Verify rack exists
-    let _rack = db_rack::get(&mut txn, &rack_id).await?;
+    db_rack::get(&mut txn, &rack_id).await?;
 
     // Start the state controller to process the rack while it's active
     let rack_handler = Arc::new(TestRackStateHandler::default());
@@ -187,8 +186,8 @@ async fn test_can_retrieve_rack_state_history(
         })
         .database(pool.clone(), env.api.work_lock_manager_handle.clone())
         .processor_id(uuid::Uuid::new_v4().to_string())
-        .services(handler_services.clone())
-        .state_handler(rack_handler.clone())
+        .services(handler_services)
+        .state_handler(rack_handler)
         .build_and_spawn()
         .unwrap();
 
@@ -227,13 +226,13 @@ async fn test_can_retrieve_rack_state_history(
 #[crate::sqlx_test]
 async fn test_rack_state_transitions(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let env = create_test_env(pool.clone()).await;
-    let mut txn = pool.acquire().await?;
 
     // Create a rack
     let rack_id = RackId::from(uuid::Uuid::new_v4());
-    let _ = TestRackBuilder::new()
+    let mut txn = pool.acquire().await?;
+    TestRackDbBuilder::new()
         .with_rack_id(&rack_id)
-        .build(&env)
+        .persist(&mut txn)
         .await?;
 
     // Verify rack exists
@@ -298,14 +297,14 @@ async fn test_rack_deletion_flow(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
 
     // Create a rack
     let rack_id = RackId::from(uuid::Uuid::new_v4());
-    let _ = TestRackBuilder::new()
+    let mut txn = pool.acquire().await?;
+    TestRackDbBuilder::new()
         .with_rack_id(&rack_id)
-        .build(&env)
+        .persist(&mut txn)
         .await?;
->>>>>>> 8bdc6b2 (feat: add rack test infra and histories RPC unit test)
 
     // Verify rack exists
-    let rack = db_rack::get(&pool, rack_id).await?;
+    let rack = db_rack::get(&mut txn, &rack_id).await?;
     assert_eq!(rack.id, rack_id);
 
     // Start the state controller to process the rack while it's active
@@ -394,9 +393,10 @@ async fn test_rack_error_state_handling(
 
     // Create a rack
     let rack_id = RackId::from(uuid::Uuid::new_v4());
-    let _ = TestRackBuilder::new()
+    let mut txn = pool.acquire().await?;
+    TestRackDbBuilder::new()
         .with_rack_id(&rack_id)
-        .build(&env)
+        .persist(&mut txn)
         .await?;
 
     // Manually set the rack to error state for testing
@@ -464,15 +464,14 @@ async fn test_rack_error_state_handling(
 async fn test_rack_state_transition_validation(
     pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let env = create_test_env(pool.clone()).await;
 
     // Create a rack
     let rack_id = RackId::from(uuid::Uuid::new_v4());
-    let _ = TestRackBuilder::new()
-        .with_rack_id(&rack_id)
-        .build(&env)
-        .await?;
     let mut txn = pool.acquire().await?;
+    TestRackDbBuilder::new()
+        .with_rack_id(&rack_id)
+        .persist(&mut txn)
+        .await?;
     let rack = db_rack::get(&mut txn, &rack_id).await?;
 
     // Verify initial state is Expected
@@ -515,9 +514,10 @@ async fn test_rack_deletion_with_state_controller(
 
     // Create a rack
     let rack_id = RackId::from(uuid::Uuid::new_v4());
-    let _ = TestRackBuilder::new()
+    let mut txn = pool.acquire().await?;
+    TestRackDbBuilder::new()
         .with_rack_id(&rack_id)
-        .build(&env)
+        .persist(&mut txn)
         .await?;
 
     // Start the state controller
