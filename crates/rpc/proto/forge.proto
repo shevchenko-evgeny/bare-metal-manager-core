@@ -5667,7 +5667,7 @@ message RackStateHistoryRecord {
 }
 
 message RackStateHistoriesRequest {
-  repeated string rack_ids = 1;
+  repeated common.RackId rack_ids = 1;
 }
 
 message RackStateHistories {

@@ -21,6 +21,7 @@ use std::net::IpAddr;
 
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::power_shelf::{PowerShelfId, PowerShelfIdSource, PowerShelfType};
+use carbide_uuid::rack::RackId;
 use carbide_uuid::switch::{SwitchId, SwitchIdSource, SwitchType};
 use db::machine_interface::find_by_mac_address;
 use db::{DatabaseError, power_shelf as db_power_shelf, rack as db_rack, switch as db_switch};
@@ -1536,7 +1537,6 @@ pub async fn new_power_shelfs(env: &TestEnv, count: u32) -> eyre::Result<Vec<Pow
 }
 
 #[allow(dead_code)]
-#[derive(Default)]
 pub struct TestRackDbBuilder {
     compute_trays: Vec<MachineId>,
     power_shelves: Vec<PowerShelfId>,
@@ -1544,7 +1544,21 @@ pub struct TestRackDbBuilder {
     expected_compute_trays: Vec<MacAddress>,
     expected_power_shelves: Vec<MacAddress>,
     expected_switches: Vec<MacAddress>,
-    rack_id: Option<String>,
+    rack_id: RackId,
+}
+
+impl Default for TestRackDbBuilder {
+    fn default() -> Self {
+        TestRackDbBuilder {
+            compute_trays: vec![],
+            power_shelves: vec![],
+            switches: vec![],
+            expected_compute_trays: vec![],
+            expected_power_shelves: vec![],
+            expected_switches: vec![],
+            rack_id: RackId::from(uuid::Uuid::new_v4()),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1555,8 +1569,8 @@ impl TestRackDbBuilder {
         }
     }
 
-    pub fn with_rack_id(mut self, id: &str) -> Self {
-        self.rack_id = Some(id.to_string());
+    pub fn with_rack_id(mut self, id: RackId) -> Self {
+        self.rack_id = id;
         self
     }
 
@@ -1596,16 +1610,10 @@ impl TestRackDbBuilder {
         self
     }
 
-    pub async fn persist(&self, txn: &mut PgConnection) -> Result<String, DatabaseError> {
-        // TODO: this should be RackId. See JIRA RACKMANAGER-377
-        let rack_id = self
-            .rack_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
+    pub async fn persist(&self, txn: &mut PgConnection) -> Result<RackId, DatabaseError> {
         db_rack::create(
             txn,
-            &rack_id,
+            self.rack_id,
             self.expected_compute_trays.clone(),
             self.expected_switches.clone(),
             self.expected_power_shelves.clone(),
@@ -1620,10 +1628,10 @@ impl TestRackDbBuilder {
                 expected_power_shelves: self.expected_power_shelves.clone(),
             };
 
-            db_rack::update(txn, &rack_id, &cfg).await?;
+            db_rack::update(txn, self.rack_id, &cfg).await?;
         }
 
-        Ok(rack_id)
+        Ok(self.rack_id)
     }
 }
 

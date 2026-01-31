@@ -100,10 +100,10 @@ impl StateHandler for TestRackStateHandler {
 
         let mut txn = ctx.services.db_pool.begin().await?;
 
-        db_rack::try_update_controller_state(&mut txn, rack_id, old_version, new_state).await?;
+        db_rack::try_update_controller_state(&mut txn, *rack_id, old_version, new_state).await?;
 
         // Persist state history so we can get at it from UT
-        rack_state_history::persist(&mut txn, rack_id, &controller_state.clone(), old_version)
+        rack_state_history::persist(&mut txn, *rack_id, &controller_state.clone(), old_version)
             .await?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -144,7 +144,7 @@ async fn test_can_retrieve_rack_state_history(
         .await?;
 
     // Verify rack exists
-    db_rack::get(&mut txn, &rack_id).await?;
+    db_rack::get(&mut txn, rack_id).await?;
 
     // Start the state controller to process the rack while it's active
     let rack_handler = Arc::new(TestRackStateHandler::default());
@@ -172,7 +172,7 @@ async fn test_can_retrieve_rack_state_history(
     // get state history
 
     let state_histories_request = rpc::forge::RackStateHistoriesRequest {
-        rack_ids: vec![rack_id.clone()],
+        rack_ids: vec![rack_id],
     };
 
     let result = env
@@ -182,7 +182,10 @@ async fn test_can_retrieve_rack_state_history(
 
     let mut histories = result.into_inner().histories;
 
-    let records = histories.remove(&rack_id).unwrap_or_default().records;
+    let records = histories
+        .remove(&rack_id.to_string())
+        .unwrap_or_default()
+        .records;
 
     assert!(records.len() > 1);
 
@@ -206,12 +209,12 @@ async fn test_rack_state_transitions(pool: sqlx::PgPool) -> Result<(), Box<dyn s
     let rack_id = RackId::from(uuid::Uuid::new_v4());
     let mut txn = pool.acquire().await?;
     TestRackDbBuilder::new()
-        .with_rack_id(&rack_id)
+        .with_rack_id(rack_id)
         .persist(&mut txn)
         .await?;
 
     // Verify rack exists
-    let rack = db_rack::get(&mut txn, &rack_id).await?;
+    let rack = db_rack::get(&mut txn, rack_id).await?;
 
     // Verify initial state is Expected
     assert!(matches!(rack.controller_state.value, RackState::Expected));
@@ -264,12 +267,12 @@ async fn test_rack_deletion_flow(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
     let rack_id = RackId::from(uuid::Uuid::new_v4());
     let mut txn = pool.acquire().await?;
     TestRackDbBuilder::new()
-        .with_rack_id(&rack_id)
+        .with_rack_id(rack_id)
         .persist(&mut txn)
         .await?;
 
     // Verify rack exists
-    let rack = db_rack::get(&mut txn, &rack_id).await?;
+    let rack = db_rack::get(&mut txn, rack_id).await?;
     assert_eq!(rack.id, rack_id);
 
     // Start the state controller to process the rack while it's active
@@ -336,7 +339,7 @@ async fn test_rack_error_state_handling(
     let rack_id = RackId::from(uuid::Uuid::new_v4());
     let mut txn = pool.acquire().await?;
     TestRackDbBuilder::new()
-        .with_rack_id(&rack_id)
+        .with_rack_id(rack_id)
         .persist(&mut txn)
         .await?;
 
@@ -399,10 +402,10 @@ async fn test_rack_state_transition_validation(
     let rack_id = RackId::from(uuid::Uuid::new_v4());
     let mut txn = pool.acquire().await?;
     TestRackDbBuilder::new()
-        .with_rack_id(&rack_id)
+        .with_rack_id(rack_id)
         .persist(&mut txn)
         .await?;
-    let rack = db_rack::get(&mut txn, &rack_id).await?;
+    let rack = db_rack::get(&mut txn, rack_id).await?;
 
     // Verify initial state is Expected
     assert!(matches!(rack.controller_state.value, RackState::Expected));
@@ -446,7 +449,7 @@ async fn test_rack_deletion_with_state_controller(
     let rack_id = RackId::from(uuid::Uuid::new_v4());
     let mut txn = pool.acquire().await?;
     TestRackDbBuilder::new()
-        .with_rack_id(&rack_id)
+        .with_rack_id(rack_id)
         .persist(&mut txn)
         .await?;
 
