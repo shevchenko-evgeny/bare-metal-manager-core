@@ -444,7 +444,7 @@ pub async fn try_update_network_config(
     let query_result: Result<DpaInterfaceId, _> = sqlx::query_as(query)
         .bind(next_version)
         .bind(sqlx::types::Json(new_state))
-        .bind(interface_id.to_string())
+        .bind(interface_id)
         .bind(expected_version)
         .fetch_one(txn)
         .await;
@@ -482,6 +482,7 @@ mod test {
             ManagedHostState::Ready,
             &Metadata::default(),
             None,
+            true,
             2,
         )
         .await?;

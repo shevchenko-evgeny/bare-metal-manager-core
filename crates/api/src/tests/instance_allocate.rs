@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -187,19 +187,23 @@ async fn test_zero_dpu_instance_allocation_explicit_network_config(
             config: Some(forge::InstanceConfig {
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
                 network_security_group_id: None,
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: Some(forge::InstanceNetworkConfig {
                     interfaces: vec![forge::InstanceInterfaceConfig {
                         function_type: forge::InterfaceFunctionType::Physical as i32,
-                        network_segment_id: Some(host_inband_segment.id.0.into()),
+                        network_segment_id: Some(host_inband_segment.id),
                         network_details: None,
                         device: None,
                         device_instance: 0u32,
@@ -235,7 +239,7 @@ async fn test_zero_dpu_instance_allocation_explicit_network_config(
     );
     assert_eq!(
         instance_network_restrictions.network_segment_ids,
-        vec![host_inband_segment.id.0.into()],
+        vec![host_inband_segment.id],
         "Machine that was just ingested should have instance network restrictions listing its network segment ID's",
     );
 
@@ -277,14 +281,18 @@ async fn test_zero_dpu_instance_allocation_no_network_config(
             config: Some(forge::InstanceConfig {
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: None, // code under test: Network config is None
                 infiniband: None,
                 nvlink: None,
@@ -367,14 +375,18 @@ async fn test_zero_dpu_instance_allocation_multi_segment_no_network_config(
             config: Some(forge::InstanceConfig {
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: None, // code under test: Network config is None
                 infiniband: None,
                 nvlink: None,
@@ -488,14 +500,18 @@ async fn test_reject_single_dpu_instance_allocation_no_network_config(
             config: Some(forge::InstanceConfig {
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: None,
                 infiniband: None,
                 nvlink: None,
@@ -542,14 +558,18 @@ async fn test_reject_single_dpu_instance_allocation_host_inband_network_config(
             config: Some(forge::InstanceConfig {
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: Some(forge::InstanceNetworkConfig {
                     interfaces: vec![forge::InstanceInterfaceConfig {
                         function_type: forge::InterfaceFunctionType::Physical as i32,
@@ -660,7 +680,7 @@ async fn test_reject_zero_dpu_instance_allocation_multiple_vpcs(
             .iter()
             .contains(&host_inband_segment.id),
         "Machine that was just ingested should have instance network restrictions showing host_inband_segment {}",
-        host_inband_segment.id.0,
+        host_inband_segment.id,
     );
     assert!(
         instance_network_restrictions
@@ -668,7 +688,7 @@ async fn test_reject_zero_dpu_instance_allocation_multiple_vpcs(
             .iter()
             .contains(&host_inband_2_segment.id),
         "Machine that was just ingested should have instance network restrictions showing host_inband_2_segment {}",
-        host_inband_2_segment.id.0,
+        host_inband_2_segment.id,
     );
 
     // Allocate an instance without specifying a network config
@@ -681,14 +701,18 @@ async fn test_reject_zero_dpu_instance_allocation_multiple_vpcs(
                 network_security_group_id: None,
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: None,
                 infiniband: None,
                 dpu_extension_services: None,
@@ -735,14 +759,18 @@ async fn test_single_dpu_instance_allocation(
             config: Some(forge::InstanceConfig {
                 tenant: Some(forge::TenantConfig {
                     tenant_organization_id: "2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string(), // from sql fixture
-                    user_data: None,
-                    custom_ipxe: "exit".to_string(),
-                    always_boot_with_custom_ipxe: false,
-                    phone_home_enabled: false,
                     hostname: None,
                     tenant_keyset_ids: vec![],
                 }),
-                os: None,
+                os: Some(forge::OperatingSystem {
+                    phone_home_enabled: false,
+                    run_provisioning_instructions_on_every_boot: false,
+                    user_data: None,
+                    variant: Some(forge::operating_system::Variant::Ipxe(forge::InlineIpxe {
+                        ipxe_script: "exit".to_string(),
+                        user_data: None,
+                    })),
+                }),
                 network: Some(forge::InstanceNetworkConfig {
                     interfaces: vec![forge::InstanceInterfaceConfig {
                         function_type: forge::InterfaceFunctionType::Physical as i32,

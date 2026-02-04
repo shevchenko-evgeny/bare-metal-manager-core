@@ -477,31 +477,31 @@ async fn test_site_explorer_main(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
     // We should also have metric entries
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_explorations_count")
+            .formatted_metric("carbide_endpoint_explorations_count")
             .unwrap(),
         "2"
     );
     assert!(
         test_meter
-            .formatted_metric("forge_endpoint_exploration_success_count")
+            .formatted_metric("carbide_endpoint_exploration_success_count")
             .is_some()
     );
     // The failure metric is not emitted if no failure happened
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_exploration_duration_milliseconds_count")
+            .formatted_metric("carbide_endpoint_exploration_duration_milliseconds_count")
             .unwrap_or("2".to_string()),
         "2"
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_exploration_identified_managed_hosts_count")
+            .formatted_metric("carbide_site_exploration_identified_managed_hosts_count")
             .unwrap(),
         "0"
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_machines_count")
+            .formatted_metric("carbide_site_explorer_created_machines_count")
             .unwrap(),
         "0"
     );
@@ -541,30 +541,30 @@ async fn test_site_explorer_main(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
 
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_explorations_count")
+            .formatted_metric("carbide_endpoint_explorations_count")
             .unwrap(),
         "2"
     );
     assert!(
         test_meter
-            .formatted_metric("forge_endpoint_exploration_success_count")
+            .formatted_metric("carbide_endpoint_exploration_success_count")
             .is_some()
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_exploration_duration_milliseconds_count")
+            .formatted_metric("carbide_endpoint_exploration_duration_milliseconds_count")
             .unwrap_or("4".to_string()),
         "4"
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_exploration_identified_managed_hosts_count")
+            .formatted_metric("carbide_site_exploration_identified_managed_hosts_count")
             .unwrap(),
         "0"
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_machines_count")
+            .formatted_metric("carbide_site_explorer_created_machines_count")
             .unwrap(),
         "0"
     );
@@ -689,7 +689,7 @@ async fn test_site_explorer_main(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
 
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_exploration_identified_managed_hosts_count")
+            .formatted_metric("carbide_site_exploration_identified_managed_hosts_count")
             .unwrap(),
         "2"
     );
@@ -903,9 +903,9 @@ async fn test_site_explorer_audit_exploration_results(
     );
 
     explorer.run_single_iteration().await.unwrap();
-    // forge_endpoint_exploration_preingestions_incomplete_overall_count
+    // carbide_endpoint_exploration_preingestions_incomplete_overall_count
     let m: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_endpoint_exploration_preingestions_incomplete_overall_count")
+        .parsed_metrics("carbide_endpoint_exploration_preingestions_incomplete_overall_count")
         .into_iter()
         .collect();
 
@@ -969,9 +969,9 @@ async fn test_site_explorer_audit_exploration_results(
 
     // Check for the expected metrics
 
-    // forge_endpoint_exploration_failures_overall_count
+    // carbide_endpoint_exploration_failures_overall_count
     let m: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_endpoint_exploration_failures_overall_count")
+        .parsed_metrics("carbide_endpoint_exploration_failures_overall_count")
         .into_iter()
         .collect();
 
@@ -979,18 +979,18 @@ async fn test_site_explorer_audit_exploration_results(
     assert!(m.get("{failure=\"unauthorized\"}").unwrap() == "1");
     assert!(m.get("{failure=\"missing_credentials\"}").unwrap() == "1");
 
-    // forge_endpoint_exploration_preingestions_incomplete_overall_count
+    // carbide_endpoint_exploration_preingestions_incomplete_overall_count
     let m: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_endpoint_exploration_preingestions_incomplete_overall_count")
+        .parsed_metrics("carbide_endpoint_exploration_preingestions_incomplete_overall_count")
         .into_iter()
         .collect();
     // Everything should be done with preingestion now.
     assert!(m.is_empty());
 
-    // forge_endpoint_exploration_expected_serial_number_mismatches_overall_count
+    // carbide_endpoint_exploration_expected_serial_number_mismatches_overall_count
     let m: HashMap<String, String> = test_meter
         .parsed_metrics(
-            "forge_endpoint_exploration_expected_serial_number_mismatches_overall_count",
+            "carbide_endpoint_exploration_expected_serial_number_mismatches_overall_count",
         )
         .into_iter()
         .collect();
@@ -998,9 +998,9 @@ async fn test_site_explorer_audit_exploration_results(
     assert!(!m.is_empty());
     assert_eq!(m.get("{machine_type=\"host\"}").unwrap(), "3");
 
-    // forge_endpoint_exploration_machines_explored_overall_count
+    // carbide_endpoint_exploration_machines_explored_overall_count
     let m: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_endpoint_exploration_machines_explored_overall_count")
+        .parsed_metrics("carbide_endpoint_exploration_machines_explored_overall_count")
         .into_iter()
         .collect();
 
@@ -1020,17 +1020,19 @@ async fn test_site_explorer_audit_exploration_results(
         "1"
     );
 
-    // forge_endpoint_exploration_expected_machines_missing_overall_count
+    // carbide_endpoint_exploration_expected_machines_missing_overall_count
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_exploration_expected_machines_missing_overall_count")
+            .formatted_metric(
+                "carbide_endpoint_exploration_expected_machines_missing_overall_count"
+            )
             .unwrap(),
         "1"
     );
 
-    // forge_endpoint_exploration_identified_managed_hosts_overall_count
+    // carbide_endpoint_exploration_identified_managed_hosts_overall_count
     let m: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_endpoint_exploration_identified_managed_hosts_overall_count")
+        .parsed_metrics("carbide_endpoint_exploration_identified_managed_hosts_overall_count")
         .into_iter()
         .collect();
 
@@ -1399,6 +1401,7 @@ async fn test_fallback_dpu_serial(pool: sqlx::PgPool) -> Result<(), Box<dyn std:
             default_pause_ingestion_and_poweron: None,
             host_nics: vec![],
             rack_id: None,
+            dpf_enabled: true,
         },
     )
     .await?;
@@ -1450,6 +1453,7 @@ async fn test_fallback_dpu_serial(pool: sqlx::PgPool) -> Result<(), Box<dyn std:
             default_pause_ingestion_and_poweron: None,
             host_nics: vec![],
             rack_id: None,
+            dpf_enabled: true,
         },
     )
     .await?;
@@ -2394,6 +2398,7 @@ async fn test_machine_creation_with_sku(
             default_pause_ingestion_and_poweron: None,
             host_nics: vec![],
             rack_id: None,
+            dpf_enabled: true,
         },
     )
     .await?;
@@ -2424,12 +2429,13 @@ async fn test_machine_creation_with_sku(
             assert_eq!(m.hw_sku, None);
         } else {
             assert_eq!(m.hw_sku, Some("Sku1".to_string()));
+            assert!(m.dpf_enabled);
         }
     }
 
     // Verify expected machine SKU metrics
     let expected_metrics: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_site_exploration_expected_machines_sku_count")
+        .parsed_metrics("carbide_site_exploration_expected_machines_sku_count")
         .into_iter()
         .collect();
 
@@ -2524,6 +2530,7 @@ async fn test_expected_machine_device_type_metrics(
             default_pause_ingestion_and_poweron: None,
             host_nics: vec![],
             rack_id: None,
+            dpf_enabled: true,
         },
     )
     .await?;
@@ -2542,6 +2549,7 @@ async fn test_expected_machine_device_type_metrics(
             default_pause_ingestion_and_poweron: None,
             host_nics: vec![],
             rack_id: None,
+            dpf_enabled: true,
         },
     )
     .await?;
@@ -2560,6 +2568,7 @@ async fn test_expected_machine_device_type_metrics(
             default_pause_ingestion_and_poweron: None,
             host_nics: vec![],
             rack_id: None,
+            dpf_enabled: true,
         },
     )
     .await?;
@@ -2680,7 +2689,7 @@ async fn test_expected_machine_device_type_metrics(
 
     // Verify expected machines SKU count metrics
     let device_type_metrics: HashMap<String, String> = test_meter
-        .parsed_metrics("forge_site_exploration_expected_machines_sku_count")
+        .parsed_metrics("carbide_site_exploration_expected_machines_sku_count")
         .into_iter()
         .collect();
 
@@ -2765,7 +2774,7 @@ async fn test_site_explorer_power_shelf_discovery(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -2861,13 +2870,13 @@ async fn test_site_explorer_power_shelf_discovery(
     // Check metrics
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_explorations_count")
+            .formatted_metric("carbide_endpoint_explorations_count")
             .unwrap(),
         "1"
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_power_shelves_count")
+            .formatted_metric("carbide_site_explorer_created_power_shelves_count")
             .unwrap(),
         "1"
     );
@@ -2924,7 +2933,7 @@ async fn test_site_explorer_power_shelf_with_expected_config(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -3086,7 +3095,7 @@ async fn test_site_explorer_power_shelf_creation_limit(
             expected_power_shelf.serial_number.clone(),
             expected_power_shelf.ip_address,
             expected_power_shelf.metadata.clone(),
-            expected_power_shelf.rack_id.clone(),
+            expected_power_shelf.rack_id,
         )
         .await?;
     }
@@ -3170,7 +3179,7 @@ async fn test_site_explorer_power_shelf_creation_limit(
     // Check that only 2 power shelves were created due to limit
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_power_shelves_count")
+            .formatted_metric("carbide_site_explorer_created_power_shelves_count")
             .unwrap(),
         "2"
     );
@@ -3181,7 +3190,7 @@ async fn test_site_explorer_power_shelf_creation_limit(
     // Check that all 3 power shelves were created
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_power_shelves_count")
+            .formatted_metric("carbide_site_explorer_created_power_shelves_count")
             .unwrap(),
         "1"
     );
@@ -3237,7 +3246,7 @@ async fn test_site_explorer_power_shelf_disabled(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -3306,7 +3315,7 @@ async fn test_site_explorer_power_shelf_disabled(
     // Check that no power shelves were created
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_power_shelves_count")
+            .formatted_metric("carbide_site_explorer_created_power_shelves_count")
             .unwrap(),
         "0"
     );
@@ -3374,7 +3383,7 @@ async fn test_site_explorer_power_shelf_error_handling(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -3436,7 +3445,7 @@ async fn test_site_explorer_power_shelf_error_handling(
     // Check metrics for error
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_exploration_failures_count")
+            .formatted_metric("carbide_endpoint_exploration_failures_count")
             .unwrap(),
         "{failure=\"unauthorized\"} 1"
     );
@@ -3523,7 +3532,7 @@ async fn test_site_explorer_creates_power_shelf(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -3580,7 +3589,7 @@ async fn test_site_explorer_creates_power_shelf(
             .create_power_shelf(
                 explored_endpoint.clone(),
                 exploration_report.clone(),
-                Some(&expected_power_shelf),
+                &expected_power_shelf,
                 &env.pool,
             )
             .await?
@@ -3609,7 +3618,7 @@ async fn test_site_explorer_creates_power_shelf(
             .create_power_shelf(
                 explored_endpoint,
                 exploration_report,
-                Some(&expected_power_shelf),
+                &expected_power_shelf,
                 &env.pool,
             )
             .await?
@@ -3738,7 +3747,7 @@ async fn test_power_shelf_state_history(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -3820,7 +3829,7 @@ async fn test_power_shelf_state_history(
             .create_power_shelf(
                 explored_endpoint.clone(),
                 exploration_report.clone(),
-                Some(&expected_power_shelf),
+                &expected_power_shelf,
                 &env.pool,
             )
             .await?
@@ -3962,7 +3971,7 @@ async fn test_power_shelf_state_history_multiple(
         expected_power_shelf1.serial_number.clone(),
         expected_power_shelf1.ip_address,
         expected_power_shelf1.metadata.clone(),
-        expected_power_shelf1.rack_id.clone(),
+        expected_power_shelf1.rack_id,
     )
     .await?;
 
@@ -3974,7 +3983,7 @@ async fn test_power_shelf_state_history_multiple(
         expected_power_shelf2.serial_number.clone(),
         expected_power_shelf2.ip_address,
         expected_power_shelf2.metadata.clone(),
-        expected_power_shelf2.rack_id.clone(),
+        expected_power_shelf2.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -4101,7 +4110,7 @@ async fn test_power_shelf_state_history_multiple(
             .create_power_shelf(
                 explored_endpoint1.clone(),
                 exploration_report1.clone(),
-                Some(&expected_power_shelf1),
+                &expected_power_shelf1,
                 &env.pool,
             )
             .await?
@@ -4112,7 +4121,7 @@ async fn test_power_shelf_state_history_multiple(
             .create_power_shelf(
                 explored_endpoint2.clone(),
                 exploration_report2.clone(),
-                Some(&expected_power_shelf2),
+                &expected_power_shelf2,
                 &env.pool,
             )
             .await?
@@ -4253,7 +4262,7 @@ async fn test_power_shelf_state_history_error_handling(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -4335,7 +4344,7 @@ async fn test_power_shelf_state_history_error_handling(
             .create_power_shelf(
                 explored_endpoint.clone(),
                 exploration_report.clone(),
-                Some(&expected_power_shelf),
+                &expected_power_shelf,
                 &env.pool,
             )
             .await?
@@ -4449,7 +4458,7 @@ async fn test_site_explorer_power_shelf_discovery_with_static_ip(
         expected_power_shelf.serial_number.clone(),
         expected_power_shelf.ip_address,
         expected_power_shelf.metadata.clone(),
-        expected_power_shelf.rack_id.clone(),
+        expected_power_shelf.rack_id,
     )
     .await?;
     txn.commit().await?;
@@ -4541,13 +4550,13 @@ async fn test_site_explorer_power_shelf_discovery_with_static_ip(
     // Check metrics
     assert_eq!(
         test_meter
-            .formatted_metric("forge_endpoint_explorations_count")
+            .formatted_metric("carbide_endpoint_explorations_count")
             .unwrap(),
         "1"
     );
     assert_eq!(
         test_meter
-            .formatted_metric("forge_site_explorer_created_power_shelves_count")
+            .formatted_metric("carbide_site_explorer_created_power_shelves_count")
             .unwrap(),
         "1"
     );

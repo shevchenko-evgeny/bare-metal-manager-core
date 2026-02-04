@@ -76,6 +76,11 @@ pub struct CarbideConfig {
     /// prometheus metrics under /metrics
     pub metrics_endpoint: Option<SocketAddr>,
 
+    /// An alternative prefix under which metrics will be emitted besides `carbide_`.
+    /// Setting this flag will allow to dual emit metrics to migrate dashboards and alerts.
+    /// Note that seting the flag will load to increased load on the observability system.
+    pub alt_metric_prefix: Option<String>,
+
     /// A connection string for the utilized postgres database
     pub database_url: String,
 
@@ -412,6 +417,14 @@ pub struct CarbideConfig {
     // DPF Config
     #[serde(default)]
     pub dpf: DpfConfig,
+
+    /// The URL to use for overriding the PXE boot url on X86 machines.
+    #[serde(default)]
+    pub x86_pxe_boot_url_override: Option<String>,
+
+    /// The URL to use for overriding the PXE boot url on ARM machines.
+    #[serde(default)]
+    pub arm_pxe_boot_url_override: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -866,10 +879,33 @@ pub struct StateControllerConfig {
 
     /// Configures the maximum amount of concurrency for the object state controller
     ///
-    /// The controller will attempt to advance the state of this amount of instances
+    /// The controller will attempt to advance the state of this amount of objects
     /// in parallel.
     #[serde(default = "StateControllerConfig::max_concurrency_default")]
     pub max_concurrency: usize,
+
+    /// Configures the maximum time the state processor will wait when checking
+    /// for and dispatching new tasks.
+    /// This value needs to be lower than `iteration_time` in order to assure that
+    /// tasks are executed more often than generated.
+    /// If the value is set to 0, the processor will dispatch object handling tasks
+    /// immediately once they are enqueued. The downside of 0 (or low) interval is
+    /// however that the state controller will poll the database for new tasks
+    /// with the same low interval.
+    #[serde(
+        default = "StateControllerConfig::processor_dispatch_interval_default",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub processor_dispatch_interval: std::time::Duration,
+
+    /// Configures how often the state handling processor will emit log messages
+    #[serde(
+        default = "StateControllerConfig::processor_log_interval_default",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub processor_log_interval: std::time::Duration,
 }
 
 impl StateControllerConfig {
@@ -879,6 +915,14 @@ impl StateControllerConfig {
 
     pub const fn iteration_time_default() -> std::time::Duration {
         std::time::Duration::from_secs(30)
+    }
+
+    pub const fn processor_dispatch_interval_default() -> std::time::Duration {
+        std::time::Duration::from_secs(2)
+    }
+
+    pub const fn processor_log_interval_default() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
     }
 
     pub const fn max_concurrency_default() -> usize {
@@ -891,6 +935,8 @@ impl Default for StateControllerConfig {
         Self {
             iteration_time: Self::iteration_time_default(),
             max_object_handling_time: Self::max_object_handling_time_default(),
+            processor_dispatch_interval: Self::processor_dispatch_interval_default(),
+            processor_log_interval: Self::processor_log_interval_default(),
             max_concurrency: Self::max_concurrency_default(),
         }
     }
@@ -902,6 +948,8 @@ impl From<&StateControllerConfig> for IterationConfig {
             iteration_time: config.iteration_time,
             max_object_handling_time: config.max_object_handling_time,
             max_concurrency: config.max_concurrency,
+            processor_dispatch_interval: config.processor_dispatch_interval,
+            processor_log_interval: config.processor_log_interval,
         }
     }
 }
@@ -2567,6 +2615,8 @@ mod tests {
                 iteration_time: std::time::Duration::from_secs(30),
                 max_object_handling_time: std::time::Duration::from_secs(60),
                 max_concurrency: 10,
+                processor_dispatch_interval: std::time::Duration::from_secs(2),
+                processor_log_interval: std::time::Duration::from_secs(60),
             },
             dpu_wait_time: Duration::minutes(20),
             power_down_wait: Duration::seconds(10),
@@ -2604,6 +2654,8 @@ mod tests {
                         iteration_time: std::time::Duration::from_secs(33),
                         max_object_handling_time: std::time::Duration::from_secs(63),
                         max_concurrency: 13,
+                        processor_dispatch_interval: std::time::Duration::from_secs(2),
+                        processor_log_interval: std::time::Duration::from_secs(60),
                     }
                 },
                 dpu_wait_time: Duration::minutes(20),
@@ -2648,6 +2700,8 @@ mod tests {
                         iteration_time: std::time::Duration::from_secs(33),
                         max_object_handling_time: std::time::Duration::from_secs(63),
                         max_concurrency: 13,
+                        processor_dispatch_interval: std::time::Duration::from_secs(2),
+                        processor_log_interval: std::time::Duration::from_secs(60),
                     }
                 },
                 network_segment_drain_time: Duration::minutes(21),
@@ -2669,7 +2723,7 @@ mod tests {
         let config_str = serde_json::to_string(&input).unwrap();
         assert_eq!(
             config_str,
-            r#"{"iteration_time":"30s","max_object_handling_time":"180s","max_concurrency":10}"#
+            r#"{"iteration_time":"30s","max_object_handling_time":"180s","max_concurrency":10,"processor_dispatch_interval":"2s","processor_log_interval":"60s"}"#
         );
         let config: StateControllerConfig = serde_json::from_str(&config_str).unwrap();
         assert_eq!(config, input);
@@ -2681,11 +2735,13 @@ mod tests {
             iteration_time: std::time::Duration::from_secs(11),
             max_object_handling_time: std::time::Duration::from_secs(22),
             max_concurrency: 33,
+            processor_dispatch_interval: std::time::Duration::from_secs(2),
+            processor_log_interval: std::time::Duration::from_secs(60),
         };
         let config_str = serde_json::to_string(&input).unwrap();
         assert_eq!(
             config_str,
-            r#"{"iteration_time":"11s","max_object_handling_time":"22s","max_concurrency":33}"#
+            r#"{"iteration_time":"11s","max_object_handling_time":"22s","max_concurrency":33,"processor_dispatch_interval":"2s","processor_log_interval":"60s"}"#
         );
         let config: StateControllerConfig = serde_json::from_str(&config_str).unwrap();
         assert_eq!(config, input);
@@ -2854,6 +2910,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(3 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(11),
                     max_concurrency: 22,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
                 dpu_wait_time: Duration::minutes(7),
                 power_down_wait: Duration::seconds(17),
@@ -2870,6 +2928,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(18 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(188),
                     max_concurrency: 1888,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
             }
         );
@@ -2880,6 +2940,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(17 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(177),
                     max_concurrency: 1777,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
             }
         );
@@ -3011,6 +3073,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(9 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(99),
                     max_concurrency: 999,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
                 dpu_wait_time: Duration::minutes(3),
                 power_down_wait: Duration::seconds(13),
@@ -3027,6 +3091,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(8 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(88),
                     max_concurrency: 888,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
             }
         );
@@ -3037,6 +3103,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(7 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(77),
                     max_concurrency: 777,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
             }
         );
@@ -3271,6 +3339,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(3 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(11),
                     max_concurrency: 22,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
                 dpu_wait_time: Duration::minutes(7),
                 power_down_wait: Duration::seconds(17),
@@ -3287,6 +3357,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(18 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(188),
                     max_concurrency: 1888,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
             }
         );
@@ -3297,6 +3369,8 @@ mod tests {
                     iteration_time: std::time::Duration::from_secs(17 * 60),
                     max_object_handling_time: std::time::Duration::from_secs(177),
                     max_concurrency: 1777,
+                    processor_dispatch_interval: std::time::Duration::from_secs(2),
+                    processor_log_interval: std::time::Duration::from_secs(60),
                 },
             }
         );

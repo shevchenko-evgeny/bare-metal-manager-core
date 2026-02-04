@@ -43,6 +43,7 @@ use crate::CarbideResult;
 use crate::cfg::file::{CarbideConfig, FirmwareGlobal, TimePeriod};
 use crate::machine_update_manager::MachineUpdateManager;
 use crate::preingestion_manager::PreingestionManager;
+use crate::redfish::test_support::RedfishSimAction;
 use crate::state_controller::machine::handler::MAX_FIRMWARE_UPGRADE_RETRIES;
 use crate::tests::common;
 use crate::tests::common::api_fixtures::{TestEnvOverrides, create_test_env};
@@ -702,13 +703,13 @@ async fn test_postingestion_bmc_upgrade(pool: sqlx::PgPool) -> CarbideResult<()>
 
     assert_eq!(
         env.test_meter
-            .formatted_metric("forge_pending_host_firmware_update_count")
+            .formatted_metric("carbide_pending_host_firmware_update_count")
             .unwrap(),
         "0"
     );
     assert_eq!(
         env.test_meter
-            .formatted_metric("forge_active_host_firmware_update_count")
+            .formatted_metric("carbide_active_host_firmware_update_count")
             .unwrap(),
         "0"
     );
@@ -1187,7 +1188,8 @@ async fn test_instance_upgrading_actual(
 
         // Simulate a tenant OKing the request
         let request = rpc::forge::InstancePowerRequest {
-            machine_id: mh.id.into(),
+            instance_id: tinstance.id.into(),
+            machine_id: None,
             operation: rpc::forge::instance_power_request::Operation::PowerReset.into(),
             boot_with_custom_ipxe: false,
             apply_updates_on_reboot: true,
@@ -2184,8 +2186,19 @@ async fn test_preingestion_time_sync_reset_flow(
     .await?;
     txn.commit().await?;
 
+    // Capture timepoint before running iteration
+    let timepoint = env.redfish_sim.timepoint();
+
     // Run iteration - should initiate BMC reset and move to BMCWasReset
     mgr.run_single_iteration().await?;
+
+    // Verify that SetUtcTimezone was called during the Start phase
+    let actions = env.redfish_sim.actions_since(&timepoint);
+    let all_actions = actions.all_hosts();
+    assert!(
+        all_actions.contains(&RedfishSimAction::SetUtcTimezone),
+        "Expected SetUtcTimezone action to be called during TimeSyncReset Start phase"
+    );
 
     let mut txn = pool.begin().await.unwrap();
     let endpoints = db::explored_endpoints::find_preingest_not_waiting_not_error(&mut txn).await?;

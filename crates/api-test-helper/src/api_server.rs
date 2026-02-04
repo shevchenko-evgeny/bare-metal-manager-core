@@ -68,6 +68,7 @@ pub async fn start(
             r#"
         listen = "{addr}"
         metrics_endpoint = "{metrics_addr}"
+        alt_metric_prefix = "alt_metric_"
         database_url = "{db_url}"
         max_database_connections = 1000
         asn = 65535
@@ -188,6 +189,7 @@ pub async fn start(
 
         [machine_state_controller.controller]
         iteration_time = "1s"
+        processor_dispatch_interval = "500ms"
         max_object_handling_time = "180s"
         max_concurrency = 10
 
@@ -196,11 +198,13 @@ pub async fn start(
 
         [network_segment_state_controller.controller]
         iteration_time = "2s"
+        processor_dispatch_interval = "500ms"
         max_object_handling_time = "180s"
         max_concurrency = 10
 
         [ib_partition_state_controller.controller]
         iteration_time = "20s"
+        processor_dispatch_interval = "2s"
         max_object_handling_time = "180s"
         max_concurrency = 10
 

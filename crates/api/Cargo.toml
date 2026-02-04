@@ -67,6 +67,7 @@ figment = { features = ["env", "toml"], workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
+hostname = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
@@ -130,6 +131,7 @@ time = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
@@ -177,6 +179,16 @@ carbide-sqlx-testing = { path = "../sqlx-testing", default-features = false }
 carbide-prost-builder = { path = "../prost-builder" }
 prometheus-text-parser = { path = "../prometheus-text-parser" }
 prost = { workspace = true }
+tower-test = { workspace = true }
+hyper = { features = ["client", "http1"], workspace = true }
+http = { workspace = true }
+once_cell = { workspace = true }
+kube = { default-features = false, features = [
+  "runtime",
+  "derive",
+  "client",
+  "rustls-tls",
+], workspace = true }
 
 [lints]
 workspace = true

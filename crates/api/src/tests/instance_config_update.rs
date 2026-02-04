@@ -24,28 +24,14 @@ use crate::tests::common::{self};
 
 /// Compares an expected instance configuration with the actual instance configuration
 ///
-/// We can't directly call `assert_eq` since carbide will fill in the OS details into
-/// the TenantConfig fields if they are not directly specified.
+/// We can't directly call `assert_eq` since carbide will fill in details into various fields
+/// that are not expected
 fn assert_config_equals(
     actual: &rpc::forge::InstanceConfig,
     expected: &rpc::forge::InstanceConfig,
 ) {
     let mut expected = expected.clone();
     let mut actual = actual.clone();
-    match &expected.os.as_ref().unwrap().variant {
-        Some(rpc::forge::operating_system::Variant::Ipxe(ipxe)) => {
-            let tenant = expected.tenant.as_mut().unwrap();
-            tenant.custom_ipxe = ipxe.ipxe_script.clone();
-            tenant.user_data = expected.os.as_ref().unwrap().user_data.clone();
-            tenant.always_boot_with_custom_ipxe = expected
-                .os
-                .as_ref()
-                .unwrap()
-                .run_provisioning_instructions_on_every_boot;
-            tenant.phone_home_enabled = expected.os.as_ref().unwrap().phone_home_enabled;
-        }
-        _ => panic!("Unexpected OS type"),
-    }
     if let Some(network) = &mut expected.network {
         network.interfaces.iter_mut().for_each(|x| {
             if let Some(NetworkDetails::VpcPrefixId(_)) = x.network_details {
@@ -87,7 +73,7 @@ async fn test_update_instance_config(_: PgPoolOptions, options: PgConnectOptions
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -136,7 +122,7 @@ async fn test_update_instance_config(_: PgPoolOptions, options: PgConnectOptions
         run_provisioning_instructions_on_every_boot: true,
         user_data: Some("SomeRandomData2".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe2".to_string(),
                 user_data: Some("SomeRandomData2".to_string()),
             },
@@ -238,7 +224,7 @@ async fn test_update_instance_config(_: PgPoolOptions, options: PgConnectOptions
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData3".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe3".to_string(),
                 user_data: Some("SomeRandomData3".to_string()),
             },
@@ -342,7 +328,7 @@ async fn test_reject_invalid_instance_config_updates(_: PgPoolOptions, options: 
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -378,7 +364,7 @@ async fn test_reject_invalid_instance_config_updates(_: PgPoolOptions, options: 
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData2".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "".to_string(),
                 user_data: Some("SomeRandomData2".to_string()),
             },
@@ -401,7 +387,7 @@ async fn test_reject_invalid_instance_config_updates(_: PgPoolOptions, options: 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert_eq!(
         err.message(),
-        "Invalid value: IpxeOperatingSystem::ipxe_script is empty"
+        "Invalid value: InlineIpxe::ipxe_script is empty"
     );
 
     // The tenant of an instance can not be updated
@@ -446,7 +432,7 @@ async fn test_reject_invalid_instance_config_updates(_: PgPoolOptions, options: 
         .interfaces
         .push(rpc::forge::InstanceInterfaceConfig {
             function_type: rpc::forge::InterfaceFunctionType::Virtual as _,
-            network_segment_id: Some(NetworkSegmentId::from(uuid::Uuid::new_v4())),
+            network_segment_id: Some(NetworkSegmentId::new()),
             network_details: None,
             device: None,
             device_instance: 0u32,
@@ -571,7 +557,7 @@ async fn test_update_instance_config_vpc_prefix_no_network_update(
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -581,9 +567,20 @@ async fn test_update_instance_config_vpc_prefix_no_network_update(
     let vpc_id = get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -694,7 +691,7 @@ async fn test_update_instance_config_vpc_prefix_network_update(
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -704,9 +701,20 @@ async fn test_update_instance_config_vpc_prefix_network_update(
     let vpc_id = get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -877,7 +885,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_post_instance_del
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -887,9 +895,20 @@ async fn test_update_instance_config_vpc_prefix_network_update_post_instance_del
     let vpc_id = get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -1013,7 +1032,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_multidpu(
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -1023,9 +1042,20 @@ async fn test_update_instance_config_vpc_prefix_network_update_multidpu(
     let vpc_id = get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -1161,7 +1191,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_multidpu_differen
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -1171,9 +1201,20 @@ async fn test_update_instance_config_vpc_prefix_network_update_multidpu_differen
     let vpc_id = get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -1186,9 +1227,20 @@ async fn test_update_instance_config_vpc_prefix_network_update_multidpu_differen
     let ip_prefix1 = "192.0.5.0/25";
     let new_vpc_prefix1 = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix1.into(),
-        name: "Test VPC prefix1".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix1.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix1".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request1 = Request::new(new_vpc_prefix1);
     let response1 = env

@@ -59,9 +59,9 @@ use model::metadata::Metadata;
 use model::network_security_group::NetworkSecurityGroupStatusObservation;
 use model::network_segment::NetworkSegmentSearchConfig;
 use model::vpc::UpdateVpcVirtualization;
+use model::vpc_prefix::VpcPrefixConfig;
 use rpc::forge::{
-    DpuExtensionService, Issue, IssueCategory, NetworkSegmentSearchFilter, OperatingSystem,
-    TpmCaCert, TpmCaCertId,
+    DpuExtensionService, Issue, IssueCategory, NetworkSegmentSearchFilter, TpmCaCert, TpmCaCertId,
 };
 use rpc::{InstanceReleaseRequest, InterfaceFunctionType, Timestamp};
 use sqlx::PgPool;
@@ -72,7 +72,9 @@ use crate::cfg::file::VmaasConfig;
 use crate::instance::{allocate_instance, allocate_network};
 use crate::network_segment::allocate::Ipv4PrefixAllocator;
 use crate::tests::common;
-use crate::tests::common::api_fixtures::instance::single_interface_network_config_with_vfs;
+use crate::tests::common::api_fixtures::instance::{
+    advance_created_instance_into_state, single_interface_network_config_with_vfs,
+};
 use crate::tests::common::api_fixtures::{
     TestEnv, create_managed_host_multi_dpu, create_managed_host_with_ek, update_time_params,
 };
@@ -192,19 +194,7 @@ async fn test_allocate_and_release_instance_impl(
     let os = instance.config().os();
     assert_eq!(os, &expected_os);
 
-    // For backward compatibilty reasons, the OS details are still signaled
-    // via `TenantConfig`
-    let mut expected_tenant_config = default_tenant_config();
-    match &expected_os.variant {
-        Some(rpc::forge::operating_system::Variant::Ipxe(ipxe)) => {
-            expected_tenant_config.custom_ipxe = ipxe.ipxe_script.clone();
-            expected_tenant_config.user_data = expected_os.user_data.clone();
-        }
-        _ => panic!("Unexpected OS"),
-    }
-    expected_tenant_config.always_boot_with_custom_ipxe =
-        expected_os.run_provisioning_instructions_on_every_boot;
-    expected_tenant_config.phone_home_enabled = expected_os.phone_home_enabled;
+    let expected_tenant_config = default_tenant_config();
     assert_eq!(tenant_config, &expected_tenant_config);
 
     let mut txn = env.db_txn().await;
@@ -373,19 +363,7 @@ async fn test_measurement_assigned_ready_to_waiting_for_measurements_to_ca_faile
     let os = instance.config().os();
     assert_eq!(os, &expected_os);
 
-    // For backward compatibilty reasons, the OS details are still signaled
-    // via `TenantConfig`
-    let mut expected_tenant_config = default_tenant_config();
-    match &expected_os.variant {
-        Some(rpc::forge::operating_system::Variant::Ipxe(ipxe)) => {
-            expected_tenant_config.custom_ipxe = ipxe.ipxe_script.clone();
-            expected_tenant_config.user_data = expected_os.user_data.clone();
-        }
-        _ => panic!("Unexpected OS"),
-    }
-    expected_tenant_config.always_boot_with_custom_ipxe =
-        expected_os.run_provisioning_instructions_on_every_boot;
-    expected_tenant_config.phone_home_enabled = expected_os.phone_home_enabled;
+    let expected_tenant_config = default_tenant_config();
     assert_eq!(tenant_config, &expected_tenant_config);
 
     let mut txn = env.db_txn().await;
@@ -1203,9 +1181,18 @@ async fn test_instance_deletion_before_provisioning_finishes(
     let instance = env.one_instance(instance_id).await;
     assert_eq!(instance.status().tenant(), rpc::TenantState::Terminating);
 
-    // Advance the instance into the "ready" state. To the tenant it will however
-    // still show up as terminating
-    advance_created_instance_into_ready_state(&env, &mh).await;
+    // Advance the instance into the "ready" state and then cleanup.
+    // The next state that requires external input is HostPlatformConfiguration.
+    // To the tenant it will however still show up as terminating
+    advance_created_instance_into_state(&env, &mh, |machine| {
+        matches!(
+            machine.state.value,
+            ManagedHostState::Assigned {
+                instance_state: InstanceState::HostPlatformConfiguration { .. },
+            }
+        )
+    })
+    .await;
     let instance = env.one_instance(instance_id).await;
     assert_eq!(instance.status().tenant(), rpc::TenantState::Terminating);
 
@@ -1635,7 +1622,7 @@ async fn test_can_not_create_instance_for_dpu(_: PgPoolOptions, options: PgConne
     let host_config = env.managed_host_config();
     let dpu_machine_id = dpu::create_dpu_machine(&env, &host_config).await;
     let request = crate::instance::InstanceAllocationRequest {
-        instance_id: InstanceId::from(uuid::Uuid::new_v4()),
+        instance_id: InstanceId::new(),
         machine_id: dpu_machine_id,
         instance_type_id: None,
         config: model::instance::config::InstanceConfig {
@@ -2024,7 +2011,7 @@ async fn test_bootingwithdiscoveryimage_delay(_: PgPoolOptions, options: PgConne
 
     assert!(
         env.test_meter
-            .formatted_metric("forge_reboot_attempts_in_booting_with_discovery_image_count")
+            .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_count")
             .is_none(),
         "State is not changed. The reboot counter should only increased once state changed"
     );
@@ -2048,7 +2035,7 @@ async fn test_bootingwithdiscoveryimage_delay(_: PgPoolOptions, options: PgConne
 
     assert!(
         env.test_meter
-            .formatted_metric("forge_reboot_attempts_in_booting_with_discovery_image_count")
+            .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_count")
             .is_none(),
         "State is not changed. The reboot counter should only increased once state changed"
     );
@@ -2057,13 +2044,13 @@ async fn test_bootingwithdiscoveryimage_delay(_: PgPoolOptions, options: PgConne
 
     assert_eq!(
         env.test_meter
-            .formatted_metric("forge_reboot_attempts_in_booting_with_discovery_image_sum")
+            .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_sum")
             .unwrap(),
         "2"
     );
     assert_eq!(
         env.test_meter
-            .formatted_metric("forge_reboot_attempts_in_booting_with_discovery_image_count")
+            .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_count")
             .unwrap(),
         "1"
     );
@@ -2079,10 +2066,6 @@ async fn test_create_instance_duplicate_keyset_ids(_: PgPoolOptions, options: Pg
     let config = rpc::InstanceConfig {
         os: Some(default_os_config()),
         tenant: Some(rpc::TenantConfig {
-            user_data: None,
-            custom_ipxe: "".to_string(),
-            phone_home_enabled: false,
-            always_boot_with_custom_ipxe: false,
             tenant_organization_id: "Tenant1".to_string(),
             tenant_keyset_ids: vec![
                 "a".to_string(),
@@ -2132,10 +2115,6 @@ async fn test_create_instance_keyset_ids_max(_: PgPoolOptions, options: PgConnec
     let config = rpc::InstanceConfig {
         os: Some(default_os_config()),
         tenant: Some(rpc::TenantConfig {
-            user_data: None,
-            custom_ipxe: "".to_string(),
-            phone_home_enabled: false,
-            always_boot_with_custom_ipxe: false,
             tenant_organization_id: "Tenant1".to_string(),
             tenant_keyset_ids: vec![
                 "a".to_string(),
@@ -2292,23 +2271,10 @@ async fn test_allocate_network_vpc_prefix_id(_: PgPoolOptions, options: PgConnec
     let config = rpc::InstanceConfig {
         tenant: Some(rpc::TenantConfig {
             tenant_organization_id: "abc".to_string(),
-            user_data: None,
-            custom_ipxe: "exit".to_string(),
-            always_boot_with_custom_ipxe: false,
-            phone_home_enabled: false,
             hostname: Some("xyz".to_string()),
             tenant_keyset_ids: vec![],
         }),
-        os: Some(OperatingSystem {
-            phone_home_enabled: false,
-            run_provisioning_instructions_on_every_boot: false,
-            user_data: Some("".to_string()),
-            variant: Some(rpc::forge::operating_system::Variant::OsImageId(
-                rpc::Uuid {
-                    value: uuid::Uuid::new_v4().to_string(),
-                },
-            )),
-        }),
+        os: Some(default_os_config()),
         network: Some(x),
         infiniband: None,
         nvlink: None,
@@ -2430,19 +2396,7 @@ async fn test_allocate_and_release_instance_vpc_prefix_id(
     let os = instance.config().os();
     assert_eq!(os, &expected_os);
 
-    // For backward compatibilty reasons, the OS details are still signaled
-    // via `TenantConfig`
-    let mut expected_tenant_config = default_tenant_config();
-    match &expected_os.variant {
-        Some(rpc::forge::operating_system::Variant::Ipxe(ipxe)) => {
-            expected_tenant_config.custom_ipxe = ipxe.ipxe_script.clone();
-            expected_tenant_config.user_data = expected_os.user_data.clone();
-        }
-        _ => panic!("Unexpected OS"),
-    }
-    expected_tenant_config.always_boot_with_custom_ipxe =
-        expected_os.run_provisioning_instructions_on_every_boot;
-    expected_tenant_config.phone_home_enabled = expected_os.phone_home_enabled;
+    let expected_tenant_config = default_tenant_config();
     assert_eq!(tenant_config, &expected_tenant_config);
 
     let mut txn = env.db_txn().await;
@@ -2776,9 +2730,17 @@ async fn create_tenant_overlay_prefix(
     let vpc_prefix_id = db::vpc_prefix::persist(
         model::vpc_prefix::NewVpcPrefix {
             id: uuid::Uuid::new_v4().into(),
-            prefix: IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
-            name: "vpc_prefix_1".to_string(),
             vpc_id,
+            config: VpcPrefixConfig {
+                prefix: IpNetwork::V4(
+                    Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap(),
+                ),
+            },
+            metadata: Metadata {
+                name: "vpc prefix 1".to_string(),
+                description: "desc".to_string(),
+                labels: HashMap::new(),
+            },
         },
         &mut txn,
     )
@@ -3268,9 +3230,20 @@ async fn test_network_details_migration(
         .api
         .create_vpc_prefix(tonic::Request::new(rpc::forge::VpcPrefixCreationRequest {
             id: None,
-            prefix: ip_prefix.into(),
-            name: "Test VPC prefix".into(),
+            prefix: String::new(),
+            name: String::new(),
             vpc_id: Some(vpc_id),
+            config: Some(rpc::forge::VpcPrefixConfig {
+                prefix: ip_prefix.into(),
+            }),
+            metadata: Some(rpc::forge::Metadata {
+                name: "Test VPC prefix".into(),
+                description: String::from("some description"),
+                labels: vec![rpc::forge::Label {
+                    key: "example_key".into(),
+                    value: Some("example_value".into()),
+                }],
+            }),
         }))
         .await
         .unwrap()
@@ -3656,7 +3629,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_delete_vf(
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -3666,9 +3639,20 @@ async fn test_update_instance_config_vpc_prefix_network_update_delete_vf(
     let vpc_id = get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -4032,7 +4016,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_state_machine(
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -4042,9 +4026,20 @@ async fn test_update_instance_config_vpc_prefix_network_update_state_machine(
     let vpc_id = common::api_fixtures::get_vpc_fixture_id(&env).await;
     let new_vpc_prefix = rpc::forge::VpcPrefixCreationRequest {
         id: None,
-        prefix: ip_prefix.into(),
-        name: "Test VPC prefix".into(),
+        prefix: String::new(),
+        name: String::new(),
         vpc_id: Some(vpc_id),
+        config: Some(rpc::forge::VpcPrefixConfig {
+            prefix: ip_prefix.into(),
+        }),
+        metadata: Some(rpc::forge::Metadata {
+            name: "Test VPC prefix".into(),
+            description: String::from("some description"),
+            labels: vec![rpc::forge::Label {
+                key: "example_key".into(),
+                value: Some("example_value".into()),
+            }],
+        }),
     };
     let request = Request::new(new_vpc_prefix);
     let response = env
@@ -4272,23 +4267,10 @@ async fn test_allocate_network_multi_dpu_vpc_prefix_id(
     let config = rpc::InstanceConfig {
         tenant: Some(rpc::TenantConfig {
             tenant_organization_id: "abc".to_string(),
-            user_data: None,
-            custom_ipxe: "exit".to_string(),
-            always_boot_with_custom_ipxe: false,
-            phone_home_enabled: false,
             hostname: Some("xyz".to_string()),
             tenant_keyset_ids: vec![],
         }),
-        os: Some(OperatingSystem {
-            phone_home_enabled: false,
-            run_provisioning_instructions_on_every_boot: false,
-            user_data: Some("".to_string()),
-            variant: Some(rpc::forge::operating_system::Variant::OsImageId(
-                rpc::Uuid {
-                    value: uuid::Uuid::new_v4().to_string(),
-                },
-            )),
-        }),
+        os: Some(default_os_config()),
         network: Some(network_config),
         infiniband: None,
         nvlink: None,
@@ -4987,7 +4969,7 @@ async fn test_can_not_update_instance_config_after_deletion(
         run_provisioning_instructions_on_every_boot: false,
         user_data: Some("SomeRandomData1".to_string()),
         variant: Some(rpc::forge::operating_system::Variant::Ipxe(
-            rpc::forge::IpxeOperatingSystem {
+            rpc::forge::InlineIpxe {
                 ipxe_script: "SomeRandomiPxe1".to_string(),
                 user_data: Some("SomeRandomData1".to_string()),
             },
@@ -5925,7 +5907,7 @@ async fn test_allocate_instance_with_invalid_ib_partition(
     let mh = create_managed_host(&env).await;
 
     // Use a non-existent IB partition ID
-    let invalid_partition_id = carbide_uuid::infiniband::IBPartitionId::from(uuid::Uuid::new_v4());
+    let invalid_partition_id = carbide_uuid::infiniband::IBPartitionId::new();
 
     let ib_config = rpc::forge::InstanceInfinibandConfig {
         ib_interfaces: vec![rpc::forge::InstanceIbInterfaceConfig {

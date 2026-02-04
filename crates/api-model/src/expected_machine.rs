@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+use carbide_uuid::rack::RackId;
 use mac_address::MacAddress;
 use rpc::errors::RpcDataConversionError;
 use serde::{Deserialize, Serialize};
@@ -58,8 +59,10 @@ pub struct ExpectedMachineData {
     pub override_id: Option<Uuid>,
     #[serde(default)]
     pub host_nics: Vec<ExpectedHostNic>,
-    pub rack_id: Option<String>,
+    pub rack_id: Option<RackId>,
     pub default_pause_ingestion_and_poweron: Option<bool>,
+    #[serde(default)]
+    pub dpf_enabled: bool,
 }
 // Important : new fields for expected machine (and data) should be optional _and_ serde(default),
 // unless you want to go update all the files in each production deployment that autoload
@@ -92,6 +95,7 @@ impl<'r> FromRow<'r, PgRow> for ExpectedMachine {
                 host_nics,
                 default_pause_ingestion_and_poweron: row
                     .try_get("default_pause_ingestion_and_poweron")?,
+                dpf_enabled: row.try_get("dpf_enabled")?,
             },
         })
     }
@@ -145,6 +149,7 @@ impl From<ExpectedMachine> for rpc::forge::ExpectedMachine {
             default_pause_ingestion_and_poweron: expected_machine
                 .data
                 .default_pause_ingestion_and_poweron,
+            dpf_enabled: expected_machine.data.dpf_enabled,
         }
     }
 }
@@ -189,6 +194,7 @@ impl TryFrom<rpc::forge::ExpectedMachine> for ExpectedMachineData {
             host_nics: em.host_nics.into_iter().map(|nic| nic.into()).collect(),
             rack_id: em.rack_id,
             default_pause_ingestion_and_poweron: em.default_pause_ingestion_and_poweron,
+            dpf_enabled: em.dpf_enabled,
         })
     }
 }

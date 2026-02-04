@@ -19,6 +19,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use carbide_dpf::KubeImpl;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::instance_type::InstanceTypeId;
 use carbide_uuid::machine::MachineId;
@@ -64,8 +65,8 @@ use rpc::forge::{
 };
 use rpc_instance::RpcInstance;
 use site_explorer::new_host_with_machine_validation;
+use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{PgConnection, PgPool};
 use tokio::sync::Mutex;
 use tonic::Request;
 use tracing_subscriber::EnvFilter;
@@ -93,11 +94,12 @@ use crate::rack::rms_client::test_support::RmsSim;
 use crate::redfish::test_support::RedfishSim;
 use crate::site_explorer::{BmcEndpointExplorer, SiteExplorer};
 use crate::state_controller::common_services::CommonStateHandlerServices;
-use crate::state_controller::controller::StateController;
+use crate::state_controller::controller::{Enqueuer, StateController};
 use crate::state_controller::ib_partition::handler::IBPartitionStateHandler;
 use crate::state_controller::ib_partition::io::IBPartitionStateControllerIO;
 use crate::state_controller::machine::handler::{
-    MachineStateHandler, MachineStateHandlerBuilder, PowerOptionConfig, ReachabilityParams,
+    DpfConfig, MachineStateHandler, MachineStateHandlerBuilder, PowerOptionConfig,
+    ReachabilityParams,
 };
 use crate::state_controller::machine::io::MachineStateControllerIO;
 use crate::state_controller::network_segment::handler::NetworkSegmentStateHandler;
@@ -107,7 +109,7 @@ use crate::state_controller::power_shelf::io::PowerShelfStateControllerIO;
 use crate::state_controller::spdm::handler::SpdmAttestationStateHandler;
 use crate::state_controller::spdm::io::SpdmStateControllerIO;
 use crate::state_controller::state_handler::{
-    StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
+    StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcomeWithTransaction,
 };
 use crate::state_controller::switch::handler::SwitchStateHandler;
 use crate::state_controller::switch::io::SwitchStateControllerIO;
@@ -220,6 +222,21 @@ lazy_static! {
     ];
 }
 
+#[derive(Clone, Debug)]
+pub struct TestDpfKubeClient {}
+
+#[async_trait::async_trait]
+impl KubeImpl for TestDpfKubeClient {
+    async fn get_kube_client(&self) -> Result<kube::Client, carbide_dpf::DpfError> {
+        let (service, _handle) = tower_test::mock::pair::<
+            http::Request<kube::client::Body>,
+            http::Response<kube::client::Body>,
+        >();
+        let client = kube::Client::new(service, "default");
+        Ok(client)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TestEnvOverrides {
     pub allow_zero_dpu_hosts: Option<bool>,
@@ -230,6 +247,7 @@ pub struct TestEnvOverrides {
     pub prevent_allocations_on_stale_dpu_agent_version: Option<bool>,
     pub network_segments_drain_period: Option<chrono::Duration>,
     pub power_manager_enabled: Option<bool>,
+    pub dpf_config: Option<DpfConfig>,
 }
 
 impl TestEnvOverrides {
@@ -238,6 +256,11 @@ impl TestEnvOverrides {
             config: Some(config),
             ..Default::default()
         }
+    }
+
+    pub fn with_dpf_config(mut self, dpf_config: DpfConfig) -> Self {
+        self.dpf_config = Some(dpf_config);
+        self
     }
 
     pub fn no_network_segments() -> Self {
@@ -290,7 +313,7 @@ impl TestEnv {
     /// test environment
     pub fn state_handler_services(&self) -> CommonStateHandlerServices {
         CommonStateHandlerServices {
-            db_pool: self.pool.clone().into(),
+            db_pool: self.pool.clone(),
             redfish_client_pool: self.redfish_sim.clone(),
             ib_fabric_manager: self.ib_fabric_manager.clone(),
             ib_pools: self.common_pools.infiniband.clone(),
@@ -484,13 +507,25 @@ impl TestEnv {
             .await;
     }
 
-    /// Runs one iteration of the network state controller handler with the services
+    /// Runs one iteration of the SPDM state controller handler with the services
     /// in this test environment
     pub async fn run_spdm_controller_iteration(&self) {
         self.spdm_state_controller
             .lock()
             .await
             .run_single_iteration()
+            .boxed()
+            .await;
+    }
+
+    /// Runs one iteration of the SPDM state controller handler with the services
+    /// in this test environment
+    /// No requeuing of tasks is allowed
+    pub async fn run_spdm_controller_iteration_no_requeue(&self) {
+        self.spdm_state_controller
+            .lock()
+            .await
+            .run_single_iteration_ext(false)
             .boxed()
             .await;
     }
@@ -922,6 +957,7 @@ pub fn get_config() -> CarbideConfig {
         site_global_vpc_vni: None,
         listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1079),
         metrics_endpoint: None,
+        alt_metric_prefix: None,
         database_url: "pgsql:://localhost".to_string(),
         max_database_connections: 1000,
         asn: 0,
@@ -1078,6 +1114,8 @@ pub fn get_config() -> CarbideConfig {
         dsx_exchange_event_bus: None,
         use_onboard_nic: Arc::new(false.into()),
         dpf: crate::cfg::file::DpfConfig::default(),
+        x86_pxe_boot_url_override: None,
+        arm_pxe_boot_url_override: None,
     }
 }
 
@@ -1308,6 +1346,7 @@ pub async fn create_test_env_with_overrides(
         common_pools.clone(),
         credential_provider.clone(),
         db_pool.clone(),
+        LogLimiter::default(),
         dyn_settings,
         bmc_explorer,
         eth_virt_data.clone(),
@@ -1318,6 +1357,8 @@ pub async fn create_test_env_with_overrides(
         nmxm_sim.clone(),
         work_lock_manager_handle.clone(),
         &test_meter.meter(),
+        Arc::new(TestDpfKubeClient {}),
+        Enqueuer::new(db_pool.clone()),
     ));
 
     let attestation_enabled = config.attestation_enabled;
@@ -1326,6 +1367,12 @@ pub async fn create_test_env_with_overrides(
     if let Some(v) = overrides.power_manager_enabled {
         power_options.enabled = v;
     }
+
+    let dpf_config = if let Some(override_dpf_config) = overrides.dpf_config {
+        override_dpf_config
+    } else {
+        DpfConfig::from(config.dpf.clone(), Arc::new(carbide_dpf::Production {}))
+    };
 
     let machine_swap = SwapHandler {
         inner: Arc::new(Mutex::new(
@@ -1346,6 +1393,7 @@ pub async fn create_test_env_with_overrides(
                     config.machine_updater.instance_autoreboot_period.clone(),
                 )
                 .power_options_config(power_options)
+                .dpf_config(dpf_config)
                 .build(),
         )),
     };
@@ -1358,7 +1406,7 @@ pub async fn create_test_env_with_overrides(
     };
 
     let handler_services = Arc::new(CommonStateHandlerServices {
-        db_pool: db_pool.clone().into(),
+        db_pool: db_pool.clone(),
         redfish_client_pool: redfish_sim.clone(),
         ib_fabric_manager: ib_fabric_manager.clone(),
         ib_pools: common_pools.infiniband.clone(),
@@ -1368,9 +1416,12 @@ pub async fn create_test_env_with_overrides(
         rms_client: None,
     });
 
+    let state_controller_id = uuid::Uuid::new_v4().to_string();
+
     let machine_controller = StateController::<MachineStateControllerIO>::builder()
         .database(db_pool.clone(), work_lock_manager_handle.clone())
-        .meter("forge_machines", test_meter.meter())
+        .meter("carbide_machines", test_meter.meter())
+        .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(machine_swap.clone()))
         .io(Arc::new(MachineStateControllerIO {
@@ -1382,6 +1433,7 @@ pub async fn create_test_env_with_overrides(
     let spdm_controller = StateController::<SpdmStateControllerIO>::builder()
         .database(db_pool.clone(), work_lock_manager_handle.clone())
         .meter("spdm", test_meter.meter())
+        .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(spdm_swap.clone()))
         .io(Arc::new(SpdmStateControllerIO {}))
@@ -1394,7 +1446,8 @@ pub async fn create_test_env_with_overrides(
 
     let ib_controller = StateController::builder()
         .database(db_pool.clone(), work_lock_manager_handle.clone())
-        .meter("forge_machines", test_meter.meter())
+        .meter("carbide_machines", test_meter.meter())
+        .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(ib_swap.clone()))
         .build_for_manual_iterations()
@@ -1412,7 +1465,8 @@ pub async fn create_test_env_with_overrides(
 
     let mut network_controller = StateController::builder()
         .database(db_pool.clone(), work_lock_manager_handle.clone())
-        .meter("forge_machines", test_meter.meter())
+        .meter("carbide_machines", test_meter.meter())
+        .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(network_swap.clone()))
         .build_for_manual_iterations()
@@ -1421,6 +1475,7 @@ pub async fn create_test_env_with_overrides(
     let power_shelf_controller = StateController::builder()
         .database(db_pool.clone(), work_lock_manager_handle.clone())
         .meter("carbide_power_shelves", test_meter.meter())
+        .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(PowerShelfStateHandler::default()))
         .build_for_manual_iterations()
@@ -1429,6 +1484,7 @@ pub async fn create_test_env_with_overrides(
     let switch_controller = StateController::builder()
         .database(db_pool.clone(), work_lock_manager_handle.clone())
         .meter("carbide_switches", test_meter.meter())
+        .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(SwitchStateHandler::default()))
         .build_for_manual_iterations()
@@ -2091,6 +2147,22 @@ pub async fn create_managed_host(env: &TestEnv) -> TestManagedHost {
     }
 }
 
+/// Create a managed host with 1 DPU (default config)
+pub async fn create_managed_host_with_dpf(env: &TestEnv) -> TestManagedHost {
+    let dpu_config = DpuConfig::with_hardware_info_template(
+        managed_host::HardwareInfoTemplate::Custom(dpu::DPU_BF3_INFO_JSON),
+    );
+    let mh_config = ManagedHostConfig::with_dpus(vec![dpu_config]);
+    let mh = site_explorer::new_mock_host_with_dpf(env, mh_config)
+        .await
+        .expect("Failed to create a new host");
+    TestManagedHost {
+        id: mh.host_snapshot.id,
+        dpu_ids: mh.dpu_snapshots.iter().map(|dpu| dpu.id).collect(),
+        api: env.api.clone(),
+    }
+}
+
 pub async fn create_managed_host_with_ek(env: &TestEnv, ek_cert: &[u8]) -> TestManagedHost {
     let host_config = ManagedHostConfig {
         tpm_ek_cert: TpmEkCertificate::from(ek_cert.to_vec()),
@@ -2407,7 +2479,7 @@ pub async fn get_vpc_fixture_id(env: &TestEnv) -> VpcId {
 /// state controller (which leads to stale metrics being saved).
 #[derive(Debug, Clone)]
 pub struct SwapHandler<H: StateHandler> {
-    inner: Arc<Mutex<H>>,
+    pub inner: Arc<Mutex<H>>,
 }
 
 #[async_trait::async_trait]
@@ -2428,13 +2500,12 @@ where
         object_id: &Self::ObjectId,
         state: &mut Self::State,
         controller_state: &Self::ControllerState,
-        txn: &mut PgConnection,
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcomeWithTransaction<Self::ControllerState>, StateHandlerError> {
         self.inner
             .lock()
             .await
-            .handle_object_state(object_id, state, controller_state, txn, ctx)
+            .handle_object_state(object_id, state, controller_state, ctx)
             .await
     }
 }
