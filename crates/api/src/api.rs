@@ -69,7 +69,7 @@ pub struct Api {
     pub(crate) rms_client: Option<Arc<Box<dyn RmsApi>>>,
     pub(crate) nmxm_pool: Arc<dyn NmxmClientPool>,
     pub(crate) work_lock_manager_handle: WorkLockManagerHandle,
-    pub(crate) metrics: ApiMetrics,
+    pub metrics: ApiMetrics,
 }
 
 pub(crate) type ScoutStreamType =
