@@ -22,7 +22,7 @@ use model::machine_validation::{MachineValidationState, MachineValidationStatus}
 use tonic::{Request, Response, Status};
 
 use crate::CarbideError;
-use crate::api::metrics::ApiMetricEmitters;
+use crate::api::metrics::ApiMetricsEmitter;
 use crate::api::{Api, log_request_data};
 use crate::handlers::utils::convert_and_log_machine_id;
 
@@ -297,7 +297,7 @@ pub(crate) async fn forge_agent_control(
 }
 
 /// Records reboot duration metric for a machine if applicable
-fn record_reboot_duration_metric(metrics: &ApiMetricEmitters, machine: &model::machine::Machine) {
+fn record_reboot_duration_metric(metric_emitter: &ApiMetricsEmitter, machine: &model::machine::Machine) {
     let Some(last_reboot_requested) = &machine.last_reboot_requested else {
         return;
     };
@@ -332,7 +332,7 @@ fn record_reboot_duration_metric(metrics: &ApiMetricEmitters, machine: &model::m
         .map(|dmi| dmi.sys_vendor.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
-    metrics.record_machine_reboot_duration(
+    metric_emitter.record_machine_reboot_duration(
         reboot_duration_secs as u64,
         product_name,
         vendor,
@@ -354,7 +354,7 @@ pub(crate) async fn reboot_completed(
         .load_machine(&machine_id, MachineSearchConfig::default())
         .await?;
 
-    record_reboot_duration_metric(&api.metrics, &machine);
+    record_reboot_duration_metric(&api.metric_emitter, &machine);
 
     db::machine::update_reboot_time(&machine, &mut txn).await?;
 

@@ -39,7 +39,7 @@ use sqlx::{PgPool, PgTransaction};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
-use self::metrics::ApiMetricEmitters;
+use self::metrics::ApiMetricsEmitter;
 use self::rpc::forge_server::Forge;
 use crate::cfg::file::CarbideConfig;
 use crate::dynamic_settings::DynamicSettings;
@@ -74,7 +74,7 @@ pub struct Api {
     pub(crate) work_lock_manager_handle: WorkLockManagerHandle,
     pub(crate) kube_client_provider: Arc<dyn KubeImpl>,
     pub(crate) machine_state_handler_enqueuer: Enqueuer<MachineStateControllerIO>,
-    pub(crate) metrics: ApiMetricEmitters,
+    pub(crate) metric_emitter: ApiMetricsEmitter,
 }
 
 pub(crate) type ScoutStreamType =

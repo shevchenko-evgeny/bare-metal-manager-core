@@ -38,7 +38,7 @@ use tokio::sync::{Semaphore, oneshot};
 use tracing_log::AsLog as _;
 
 use crate::api::Api;
-use crate::api::metrics::ApiMetricEmitters;
+use crate::api::metrics::ApiMetricsEmitter;
 use crate::cfg::file::{CarbideConfig, ListenMode};
 use crate::dpa::DpaInfo;
 use crate::dynamic_settings::DynamicSettings;
@@ -381,7 +381,7 @@ pub async fn start_api(
         work_lock_manager_handle,
         kube_client_provider: Arc::new(carbide_dpf::Production {}),
         machine_state_handler_enqueuer: Enqueuer::new(db_pool),
-        metrics: ApiMetricEmitters::new(&meter),
+        metric_emitter: ApiMetricsEmitter::new(&meter),
     });
 
     let (controllers_stop_tx, controllers_stop_rx) = oneshot::channel();

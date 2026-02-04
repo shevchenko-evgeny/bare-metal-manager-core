@@ -72,7 +72,7 @@ use tonic::Request;
 use tracing_subscriber::EnvFilter;
 
 use crate::api::Api;
-use crate::api::metrics::ApiMetricEmitters;
+use crate::api::metrics::ApiMetricsEmitter;
 use crate::cfg::file::{
     BomValidationConfig, CarbideConfig, DpaConfig, DpaInterfaceStateControllerConfig,
     DpuConfig as InitialDpuConfig, FirmwareGlobal, IBFabricConfig, IbFabricDefinition,
@@ -1362,7 +1362,7 @@ pub async fn create_test_env_with_overrides(
         nmxm_pool: nmxm_sim.clone(),
         work_lock_manager_handle: work_lock_manager_handle.clone(),
         machine_state_handler_enqueuer: Enqueuer::new(db_pool.clone()),
-        metrics: ApiMetricEmitters::new(&test_meter.meter()),
+        metric_emitter: ApiMetricsEmitter::new(&test_meter.meter()),
     });
 
     let attestation_enabled = config.attestation_enabled;

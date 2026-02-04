@@ -18,11 +18,11 @@ use opentelemetry_sdk::metrics::{Aggregation, Instrument, InstrumentKind, Stream
 const MACHINE_REBOOT_DURATION_METRIC_NAME: &str = "carbide_machine_reboot_duration_seconds";
 
 /// Holds all metrics related to the API service
-pub struct ApiMetricEmitters {
+pub struct ApiMetricsEmitter {
     machine_reboot_duration_histogram: Histogram<u64>,
 }
 
-impl ApiMetricEmitters {
+impl ApiMetricsEmitter {
     pub fn new(meter: &Meter) -> Self {
         let machine_reboot_duration_histogram = meter
             .u64_histogram(MACHINE_REBOOT_DURATION_METRIC_NAME)
