@@ -10,20 +10,19 @@
  * its affiliates is strictly prohibited.
  */
 
-use model::machine::MachineLastRebootRequestedMode;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Histogram, Meter};
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, InstrumentKind, Stream, View};
 
 /// Metric name for machine reboot duration histogram
-pub const MACHINE_REBOOT_DURATION_METRIC_NAME: &str = "forge_machine_reboot_duration_seconds";
+const MACHINE_REBOOT_DURATION_METRIC_NAME: &str = "carbide_machine_reboot_duration_seconds";
 
 /// Holds all metrics related to the API service
-pub struct ApiMetrics {
-    pub machine_reboot_duration_histogram: Histogram<u64>,
+pub struct ApiMetricEmitters {
+    machine_reboot_duration_histogram: Histogram<u64>,
 }
 
-impl ApiMetrics {
+impl ApiMetricEmitters {
     pub fn new(meter: &Meter) -> Self {
         let machine_reboot_duration_histogram = meter
             .u64_histogram(MACHINE_REBOOT_DURATION_METRIC_NAME)
@@ -53,50 +52,21 @@ impl ApiMetrics {
         opentelemetry_sdk::metrics::new_view(criteria, mask)
     }
 
-    /// Records the machine reboot duration metric with product information
-    pub fn record_reboot_duration(&self, machine: &model::machine::Machine) {
-        let Some(last_reboot_requested) = &machine.last_reboot_requested else {
-            return;
-        };
-
-        // Skip recording metrics for PowerOff requests
-        if matches!(
-            last_reboot_requested.mode,
-            MachineLastRebootRequestedMode::PowerOff
-        ) {
-            return;
-        }
-
-        let reboot_duration_secs = (chrono::Utc::now() - last_reboot_requested.time).num_seconds();
-
-        // Only record positive durations (in case of clock skew)
-        if reboot_duration_secs <= 0 {
-            return;
-        }
-
-        // Extract product name, and vendor from hardware info
-        let product_name = machine
-            .hardware_info
-            .as_ref()
-            .and_then(|hi| hi.dmi_data.as_ref())
-            .map(|dmi| dmi.product_name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let vendor = machine
-            .hardware_info
-            .as_ref()
-            .and_then(|hi| hi.dmi_data.as_ref())
-            .map(|dmi| dmi.sys_vendor.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Record histogram with product serial, name, vendor, and request mode as attributes
+    /// Records machine reboot duration with product information
+    pub fn record_machine_reboot_duration(
+        &self,
+        duration_secs: u64,
+        product_name: String,
+        vendor: String,
+        reboot_mode: String,
+    ) {
         let attributes = [
             KeyValue::new("product_name", product_name),
             KeyValue::new("vendor", vendor),
-            KeyValue::new("reboot_mode", last_reboot_requested.mode.to_string()),
+            KeyValue::new("reboot_mode", reboot_mode),
         ];
 
         self.machine_reboot_duration_histogram
-            .record(reboot_duration_secs as u64, &attributes);
+            .record(duration_secs, &attributes);
     }
 }

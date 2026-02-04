@@ -29,7 +29,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, filter, reload};
 
 use super::level_filter::ActiveLevel;
-use crate::api::ApiMetrics;
+use crate::api::ApiMetricEmitters;
 use crate::logging::level_filter::ReloadableFilter;
 use crate::logging::sqlx_query_tracing;
 
@@ -194,7 +194,7 @@ pub fn create_metrics() -> Result<Metrics, opentelemetry_sdk::metrics::MetricErr
         .with_resource(service_telemetry_attributes)
         .with_view(create_metric_view_for_retry_histograms("*_attempts_*")?)
         .with_view(create_metric_view_for_retry_histograms("*_retries_*")?)
-        .with_view(ApiMetrics::machine_reboot_duration_view()?)
+        .with_view(ApiMetricEmitters::machine_reboot_duration_view()?)
         .build();
     // After this call `global::meter()` will be available
     opentelemetry::global::set_meter_provider(meter_provider.clone());
@@ -339,7 +339,7 @@ mod tests {
             .with_reader(metrics_exporter)
             .with_view(create_metric_view_for_retry_histograms("*_attempts_*").unwrap())
             .with_view(create_metric_view_for_retry_histograms("*_retries_*").unwrap())
-            .with_view(ApiMetrics::machine_reboot_duration_view().unwrap())
+            .with_view(ApiMetricEmitters::machine_reboot_duration_view().unwrap())
             .build();
 
         let state = KeyValue::new("state", "mystate");

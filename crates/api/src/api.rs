@@ -17,7 +17,7 @@ use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub use self::metrics::ApiMetrics;
+pub use self::metrics::ApiMetricEmitters;
 pub use ::rpc::forge as rpc;
 use ::rpc::forge::{RemoveSkuRequest, SkuIdList};
 use ::rpc::protos::dns::{
@@ -69,7 +69,7 @@ pub struct Api {
     pub(crate) rms_client: Option<Arc<Box<dyn RmsApi>>>,
     pub(crate) nmxm_pool: Arc<dyn NmxmClientPool>,
     pub(crate) work_lock_manager_handle: WorkLockManagerHandle,
-    pub metrics: ApiMetrics,
+    pub metrics: ApiMetricEmitters,
 }
 
 pub(crate) type ScoutStreamType =
@@ -3077,7 +3077,7 @@ impl Api {
         work_lock_manager_handle: WorkLockManagerHandle,
         meter: &opentelemetry::metrics::Meter,
     ) -> Self {
-        let metrics = ApiMetrics::new(meter);
+        let metrics = ApiMetricEmitters::new(meter);
 
         Self {
             database_connection,
