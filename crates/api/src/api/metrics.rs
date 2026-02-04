@@ -24,7 +24,6 @@ pub struct ApiMetrics {
 }
 
 impl ApiMetrics {
-    /// Creates a new ApiMetrics instance with all metrics initialized
     pub fn new(meter: &Meter) -> Self {
         let machine_reboot_duration_histogram = meter
             .u64_histogram(MACHINE_REBOOT_DURATION_METRIC_NAME)
@@ -42,15 +41,13 @@ impl ApiMetrics {
     /// Machine reboots typically take 5-20 minutes (300-1200 seconds).
     /// Buckets are optimized for this range with additional buckets for faster/slower reboots.
     ///
-    /// Boundaries in seconds: 1min, 2min, 3min, 5min, 7min, 10min, 15min, 20min, 30min, 45min, 60min
+    /// Boundaries in seconds: 3min, 5min, 10min, 15min, 30min, 60min
     pub fn machine_reboot_duration_view()
     -> Result<Box<dyn View>, opentelemetry_sdk::metrics::MetricError> {
         let mut criteria = Instrument::new().name(MACHINE_REBOOT_DURATION_METRIC_NAME.to_string());
         criteria.kind = Some(InstrumentKind::Histogram);
         let mask = Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-            boundaries: vec![
-                60.0, 120.0, 180.0, 300.0, 420.0, 600.0, 900.0, 1200.0, 1800.0, 2700.0, 3600.0,
-            ],
+            boundaries: vec![180.0, 300.0, 600.0, 900.0, 1800.0, 3600.0],
             record_min_max: true,
         });
         opentelemetry_sdk::metrics::new_view(criteria, mask)
