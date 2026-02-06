@@ -27,9 +27,7 @@ use carbide_dpf::KubeImpl;
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Duration, Utc};
 use config_version::{ConfigVersion, Versioned};
-use db::host_machine_update::clear_host_reprovisioning_request;
-use db::machine::update_restart_verification_status;
-use db::{self};
+use db::db_read::PgPoolReader;
 use eyre::eyre;
 use forge_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialProvider, Credentials,
@@ -77,7 +75,6 @@ use model::power_manager::PowerHandlingOutcome;
 use model::resource_pool::common::CommonPools;
 use model::site_explorer::ExploredEndpoint;
 use sku::{handle_bom_validation_requested, handle_bom_validation_state};
-use sqlx::PgConnection;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::Semaphore;
@@ -99,7 +96,6 @@ use crate::state_controller::machine::{
 };
 use crate::state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
-    StateHandlerOutcomeWithTransaction,
 };
 
 mod dpf;
@@ -111,6 +107,9 @@ use helpers::{
     DpuDiscoveringStateHelper, DpuInitStateHelper, ManagedHostStateHelper, NextState,
     ReprovisionStateHelper, all_equal,
 };
+
+use crate::state_controller::machine::db_write_batch::DbWriteBatch;
+use crate::write_op;
 
 // We can't use http::StatusCode because libredfish has a newer version
 const NOT_FOUND: u16 = 404;
@@ -137,6 +136,7 @@ pub struct HostHandlerParams {
     pub reachability_params: ReachabilityParams,
     pub machine_validation_config: MachineValidationConfig,
     pub bom_validation: BomValidationConfig,
+    pub pending_db_writes: Arc<DbWriteBatch>,
 }
 
 /// Parameters used by the Power config.
@@ -160,7 +160,7 @@ impl From<PowerManagerOptions> for PowerOptionConfig {
 }
 
 /// The actual Machine State handler
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MachineStateHandler {
     host_handler: HostMachineStateHandler,
     pub dpu_handler: DpuMachineStateHandler,
@@ -171,6 +171,7 @@ pub struct MachineStateHandler {
     host_upgrade: Arc<HostUpgradeState>,
     power_options_config: PowerOptionConfig,
     enable_secure_boot: bool,
+    pending_db_writes: Arc<DbWriteBatch>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +396,7 @@ impl MachineStateHandler {
                 .to_std()
                 .unwrap_or(tokio::time::Duration::from_secs(30)),
         });
+        let pending_db_writes = Arc::new(DbWriteBatch::new());
         MachineStateHandler {
             dpu_up_threshold: builder.dpu_up_threshold,
             host_handler: HostMachineStateHandler::new(HostHandlerParams {
@@ -402,6 +404,7 @@ impl MachineStateHandler {
                 reachability_params: builder.reachability_params,
                 machine_validation_config: builder.machine_validation_config,
                 bom_validation: builder.bom_validation,
+                pending_db_writes: pending_db_writes.clone(),
             }),
             dpu_handler: DpuMachineStateHandler::new(
                 builder.dpu_nic_firmware_initial_update_enabled,
@@ -409,6 +412,7 @@ impl MachineStateHandler {
                 builder.reachability_params,
                 builder.enable_secure_boot,
                 builder.dpf_config.clone(),
+                pending_db_writes.clone(),
             ),
             instance_handler: InstanceStateHandler::new(
                 builder.attestation_enabled,
@@ -418,11 +422,13 @@ impl MachineStateHandler {
                 builder.hardware_models.clone().unwrap_or_default(),
                 builder.enable_secure_boot,
                 builder.dpf_config.clone(),
+                pending_db_writes.clone(),
             ),
             reachability_params: builder.reachability_params,
             host_upgrade,
             power_options_config: builder.power_options_config,
             enable_secure_boot: builder.enable_secure_boot,
+            pending_db_writes,
         }
     }
 
@@ -538,72 +544,64 @@ impl MachineStateHandler {
             .is_some();
     }
 
-    async fn record_health_history(
-        &self,
-        mh_snapshot: &mut ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-    ) -> Result<(), StateHandlerError> {
-        db::machine_health_history::persist(
-            txn,
-            &mh_snapshot.host_snapshot.id,
-            &mh_snapshot.aggregate_health,
-        )
-        .await?;
-
-        Ok(())
+    fn record_health_history(&self, mh_snapshot: &mut ManagedHostStateSnapshot) {
+        let machine_id = mh_snapshot.host_snapshot.id;
+        let health_report = mh_snapshot.aggregate_health.clone();
+        self.pending_db_writes
+            .push(write_op!(|txn| db::machine_health_history::persist(
+                txn,
+                &machine_id,
+                &health_report
+            )));
     }
 
-    async fn clear_dpu_reprovision(
+    fn clear_dpu_reprovision(
         mh_snaphost: &ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-    ) -> Result<(), StateHandlerError> {
-        db::machine::remove_health_report_override(
+        pending_db_writes: &DbWriteBatch,
+    ) {
+        let machine_id = mh_snaphost.host_snapshot.id;
+        pending_db_writes.push(write_op!(|txn| db::machine::remove_health_report_override(
             txn,
-            &mh_snaphost.host_snapshot.id,
+            &machine_id,
             health_report::OverrideMode::Merge,
-            model::machine_update_module::HOST_UPDATE_HEALTH_REPORT_SOURCE,
-        )
-        .await?;
+            model::machine_update_module::HOST_FW_UPDATE_HEALTH_REPORT_SOURCE,
+        )));
 
         for dpu_snapshot in &mh_snaphost.dpu_snapshots {
-            db::machine::clear_dpu_reprovisioning_request(txn, &dpu_snapshot.id, false)
-                .await
-                .map_err(StateHandlerError::from)?;
+            let dpu_id = dpu_snapshot.id;
+            pending_db_writes.push(write_op!(|txn| {
+                db::machine::clear_dpu_reprovisioning_request(txn, &dpu_id, false)
+            }));
         }
-
-        Ok(())
     }
 
-    async fn clear_host_reprovision(
+    fn clear_host_reprovision(
         mh_snaphost: &ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-    ) -> Result<(), StateHandlerError> {
+        pending_db_writes: &DbWriteBatch,
+    ) {
         // Host fw update health override is not set yet. It is done when host re-provisioning is
         // started in state handler.
-        clear_host_reprovisioning_request(txn, &mh_snaphost.host_snapshot.id)
-            .await
-            .map_err(StateHandlerError::from)?;
-
-        Ok(())
+        let machine_id = mh_snaphost.host_snapshot.id;
+        pending_db_writes.push(write_op!(|txn| {
+            db::host_machine_update::clear_host_reprovisioning_request(txn, &machine_id)
+        }));
     }
 
-    async fn clear_host_update_alert_and_reprov(
+    fn clear_host_update_alert_and_reprov(
         mh_snaphost: &ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-    ) -> Result<(), StateHandlerError> {
+        pending_db_writes: &DbWriteBatch,
+    ) {
         // Clear DPU reprovision
-        Self::clear_dpu_reprovision(mh_snaphost, txn).await?;
+        Self::clear_dpu_reprovision(mh_snaphost, pending_db_writes);
 
         // Clear host reprovision
-        Self::clear_host_reprovision(mh_snaphost, txn).await
+        Self::clear_host_reprovision(mh_snaphost, pending_db_writes);
     }
 
-    #[allow(txn_held_across_await)]
     async fn attempt_state_transition(
         &self,
         host_machine_id: &MachineId,
         mh_snapshot: &mut ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
         ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let mh_state = mh_snapshot.managed_state.clone();
@@ -619,18 +617,19 @@ impl MachineStateHandler {
                     let since_last_seen = Utc::now().signed_duration_since(observed_at);
                     if since_last_seen > self.dpu_up_threshold {
                         let message = format!("Last seen over {} ago", self.dpu_up_threshold);
-                        let dpu_machine_id = &dpu_snapshot.id;
+                        let dpu_machine_id = dpu_snapshot.id;
                         let health_report = health_report::HealthReport::heartbeat_timeout(
                             "forge-dpu-agent".to_string(),
                             "forge-dpu-agent".to_string(),
                             message,
                         );
-                        db::machine::update_dpu_agent_health_report(
-                            txn,
-                            dpu_machine_id,
-                            &health_report,
-                        )
-                        .await?;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            db::machine::update_dpu_agent_health_report(
+                                txn,
+                                &dpu_machine_id,
+                                &health_report,
+                            )
+                        }));
 
                         tracing::warn!(
                         host_machine_id = %host_machine_id,
@@ -644,7 +643,9 @@ impl MachineStateHandler {
             }
         }
 
-        if let Some(outcome) = handle_restart_verification(mh_snapshot, txn, ctx).await? {
+        if let Some(outcome) =
+            handle_restart_verification(mh_snapshot, &self.pending_db_writes, ctx).await?
+        {
             return Ok(outcome);
         }
 
@@ -656,7 +657,7 @@ impl MachineStateHandler {
             );
             if restart_reprov
                 && let Some(next_state) = self
-                    .start_dpu_reprovision(&mh_state, mh_snapshot, ctx, txn, host_machine_id)
+                    .start_dpu_reprovision(&mh_state, mh_snapshot, ctx, host_machine_id)
                     .await?
             {
                 return Ok(StateHandlerOutcome::transition(next_state));
@@ -736,7 +737,7 @@ impl MachineStateHandler {
                                 mh_snapshot,
                                 dpu_snapshot,
                                 &mh_state,
-                                txn,
+                                &self.pending_db_writes,
                                 ctx,
                             )
                             .await?;
@@ -753,13 +754,13 @@ impl MachineStateHandler {
             }
             ManagedHostState::DPUInit { .. } => {
                 self.dpu_handler
-                    .handle_object_state_inner(mh_snapshot, txn, ctx)
+                    .handle_object_state(host_machine_id, mh_snapshot, &mh_state, ctx)
                     .await
             }
 
             ManagedHostState::HostInit { .. } => {
                 self.host_handler
-                    .handle_object_state_inner(host_machine_id, mh_snapshot, txn, ctx)
+                    .handle_object_state(host_machine_id, mh_snapshot, &mh_state, ctx)
                     .await
             }
 
@@ -781,7 +782,10 @@ impl MachineStateHandler {
                     // Instance is requested by user. Let's configure it.
 
                     // Clear if any reprovision (dpu or host) is set due to race scenario.
-                    Self::clear_host_update_alert_and_reprov(mh_snapshot, txn).await?;
+                    Self::clear_host_update_alert_and_reprov(
+                        mh_snapshot,
+                        self.pending_db_writes.as_ref(),
+                    );
 
                     let mut next_state = ManagedHostState::Assigned {
                         instance_state: InstanceState::DpaProvisioning,
@@ -795,14 +799,13 @@ impl MachineStateHandler {
                             instance_state: InstanceState::WaitingForDpaToBeReady,
                         };
                     }
-
                     return Ok(StateHandlerOutcome::transition(next_state));
                 }
 
                 if let Some(outcome) = handle_bom_validation_requested(
-                    txn,
                     &self.host_handler.host_handler_params,
                     mh_snapshot,
+                    ctx.services,
                 )
                 .await?
                 {
@@ -817,29 +820,36 @@ impl MachineStateHandler {
                             ctx.services,
                             host_machine_id,
                             HostFirmwareScenario::Ready,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?
                     {
-                        let health_override =
+                        let health_report =
                         crate::machine_update_manager::machine_update_module::create_host_update_health_report_hostfw();
+                        let host_machine_id = *host_machine_id;
                         // The health report alert gets generated here, the machine update manager retains responsibilty for clearing it when we're done.
-                        db::machine::insert_health_report_override(
-                            txn,
-                            host_machine_id,
-                            health_report::OverrideMode::Merge,
-                            &health_override,
-                            false,
-                        )
-                        .await?;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            db::machine::insert_health_report_override(
+                                txn,
+                                &host_machine_id,
+                                health_report::OverrideMode::Merge,
+                                &health_report,
+                                false,
+                            )
+                        }));
 
                         return Ok(StateHandlerOutcome::transition(next_state));
                     } else {
                         return Ok(StateHandlerOutcome::do_nothing());
                     }
                 }
-                if let Some(outcome) =
-                    handle_machine_validation_requested(txn, mh_snapshot, false).await?
+                if let Some(outcome) = handle_machine_validation_requested(
+                    self.pending_db_writes.as_ref(),
+                    ctx.services,
+                    mh_snapshot,
+                    false,
+                )
+                .await?
                 {
                     return Ok(outcome);
                 }
@@ -849,19 +859,25 @@ impl MachineStateHandler {
                     let mut dpus_for_reprov = vec![];
                     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                         if dpu_snapshot.reprovision_requested.is_some() {
-                            handler_restart_dpu(dpu_snapshot, ctx.services, txn).await?;
-                            db::machine::update_dpu_reprovision_start_time(&dpu_snapshot.id, txn)
-                                .await?;
+                            handler_restart_dpu(
+                                dpu_snapshot,
+                                ctx.services,
+                                self.pending_db_writes.as_ref(),
+                            )
+                            .await?;
+                            let dpu_machine_id = dpu_snapshot.id;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::update_dpu_reprovision_start_time(&dpu_machine_id, txn)
+                            }));
                             dpus_for_reprov.push(dpu_snapshot);
                         }
                     }
 
                     set_managed_host_topology_update_needed(
-                        txn,
+                        self.pending_db_writes.as_ref(),
                         &mh_snapshot.host_snapshot,
                         &dpus_for_reprov,
-                    )
-                    .await?;
+                    );
 
                     let reprov_state = ReprovisionState::next_substate_based_on_bfb_support(
                         self.enable_secure_boot,
@@ -876,15 +892,18 @@ impl MachineStateHandler {
                     )?;
 
                     let health_override = crate::machine_update_manager::machine_update_module::create_host_update_health_report_dpufw();
+                    let host_machine_id = *host_machine_id;
+
                     // Mark the Host as in update.
-                    db::machine::insert_health_report_override(
-                        txn,
-                        host_machine_id,
-                        health_report::OverrideMode::Merge,
-                        &health_override,
-                        false,
-                    )
-                    .await?;
+                    self.pending_db_writes.push(write_op!(|txn| {
+                        db::machine::insert_health_report_override(
+                            txn,
+                            &host_machine_id,
+                            health_report::OverrideMode::Merge,
+                            &health_override,
+                            false,
+                        )
+                    }));
                     return Ok(StateHandlerOutcome::transition(next_state));
                 }
 
@@ -892,7 +911,11 @@ impl MachineStateHandler {
                 // if so, just place it into the measuring state and let it be handled inside
                 // the measurement state
                 if self.host_handler.host_handler_params.attestation_enabled
-                    && check_if_should_redo_measurements(&mh_snapshot.host_snapshot.id, txn).await?
+                    && check_if_should_redo_measurements(
+                        &mh_snapshot.host_snapshot.id,
+                        &mut ctx.services.db_reader,
+                    )
+                    .await?
                 {
                     return Ok(StateHandlerOutcome::transition(
                         ManagedHostState::Measuring {
@@ -929,15 +952,14 @@ impl MachineStateHandler {
             ManagedHostState::Assigned { instance_state: _ } => {
                 // Process changes needed for instance.
                 self.instance_handler
-                    .handle_object_state_inner(host_machine_id, mh_snapshot, txn, ctx)
+                    .handle_object_state(host_machine_id, mh_snapshot, &mh_state, ctx)
                     .await
             }
 
             ManagedHostState::WaitingForCleanup { cleanup_state } => {
                 let redfish_client = ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                    .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                     .await?;
 
                 match cleanup_state {
@@ -1047,7 +1069,7 @@ impl MachineStateHandler {
                                     redfish_client.as_ref(),
                                     mh_snapshot,
                                     ctx.services,
-                                    txn,
+                                    self.pending_db_writes.as_ref(),
                                 )
                                 .await
                             }
@@ -1064,7 +1086,7 @@ impl MachineStateHandler {
                                 None,
                                 &self.reachability_params,
                                 ctx.services,
-                                txn,
+                                self.pending_db_writes.as_ref(),
                             )
                             .await?;
                             return Ok(StateHandlerOutcome::wait(status.status));
@@ -1075,7 +1097,7 @@ impl MachineStateHandler {
                             mh_snapshot,
                             ctx.services,
                             SystemPowerControl::ForceRestart,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?;
 
@@ -1243,7 +1265,7 @@ impl MachineStateHandler {
                                     redfish_client.as_ref(),
                                     mh_snapshot,
                                     ctx.services,
-                                    txn,
+                                    self.pending_db_writes.as_ref(),
                                 )
                                 .await
                             }
@@ -1300,8 +1322,11 @@ impl MachineStateHandler {
                             ctx.metrics
                                 .machine_reboot_attempts_in_failed_during_discovery =
                                 Some(*retry_count as u64);
+                            let machine_id = *machine_id;
                             // Anytime host discovery is successful, move to next state.
-                            db::machine::clear_failure_details(machine_id, txn).await?;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::clear_failure_details(&machine_id, txn)
+                            }));
                             let next_state = ManagedHostState::HostInit {
                                 machine_state: MachineState::WaitingForLockdown {
                                     lockdown_info: LockdownInfo {
@@ -1321,7 +1346,7 @@ impl MachineStateHandler {
                                 mh_snapshot,
                                 ctx.services,
                                 SystemPowerControl::ForceRestart,
-                                txn,
+                                self.pending_db_writes.as_ref(),
                             )
                             .await?;
                             let next_state = ManagedHostState::Failed {
@@ -1338,7 +1363,7 @@ impl MachineStateHandler {
                             Some(*retry_count as i64),
                             &self.reachability_params,
                             ctx.services,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?
                         .increase_retry_count
@@ -1367,9 +1392,10 @@ impl MachineStateHandler {
                             let next_state = ManagedHostState::WaitingForCleanup {
                                 cleanup_state: CleanupState::Init,
                             };
-                            db::machine::clear_failure_details(machine_id, txn)
-                                .await
-                                .map_err(StateHandlerError::from)?;
+                            let machine_id = *machine_id;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::clear_failure_details(&machine_id, txn)
+                            }));
                             return Ok(StateHandlerOutcome::transition(next_state));
                         }
 
@@ -1379,7 +1405,7 @@ impl MachineStateHandler {
                             Some(*retry_count as i64),
                             &self.reachability_params,
                             ctx.services,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?
                         .increase_retry_count
@@ -1399,7 +1425,7 @@ impl MachineStateHandler {
                     | FailureCause::MeasurementsCAValidationFailed { .. } => {
                         if check_if_not_in_original_failure_cause_anymore(
                             &mh_snapshot.host_snapshot.id,
-                            txn,
+                            &mut ctx.services.db_reader,
                             &details.cause,
                             self.host_handler.host_handler_params.attestation_enabled,
                         )
@@ -1412,20 +1438,17 @@ impl MachineStateHandler {
                                             StateMachineArea::MainFlow => Ok(StateHandlerOutcome::transition(
                                                 ManagedHostState::Measuring {
                                                     measuring_state: MeasuringState::WaitingForMeasurements
-                                                }
-                                            )),
+                                                })),
                                             StateMachineArea::HostInit => Ok(StateHandlerOutcome::transition(
                                                 ManagedHostState::HostInit {
                                                     machine_state: MachineState::Measuring{
                                                         measuring_state: MeasuringState::WaitingForMeasurements
                                                     }
-                                                }
-                                            )),
+                                                })),
                                             StateMachineArea::AssignedInstance => Ok(StateHandlerOutcome::transition(
                                                 ManagedHostState::PostAssignedMeasuring {
                                                         measuring_state: MeasuringState::WaitingForMeasurements
-                                                }
-                                            )),
+                                                })),
                                             _ => Err(StateHandlerError::InvalidState(
                                                 "Unimplemented StateMachineArea for FailureSource of  MeasurementsRetired, MeasurementsRevoked, MeasurementsCAValidationFailed"
                                                     .to_string(),
@@ -1444,7 +1467,14 @@ impl MachineStateHandler {
                     FailureCause::MachineValidation { .. }
                         if machine_id.machine_type().is_host() =>
                     {
-                        match handle_machine_validation_requested(txn, mh_snapshot, true).await? {
+                        match handle_machine_validation_requested(
+                            self.pending_db_writes.as_ref(),
+                            ctx.services,
+                            mh_snapshot,
+                            true,
+                        )
+                        .await?
+                        {
                             Some(outcome) => Ok(outcome),
                             None => Ok(StateHandlerOutcome::do_nothing()),
                         }
@@ -1477,7 +1507,7 @@ impl MachineStateHandler {
                         handle_dpu_reprovision(
                             mh_snapshot,
                             &self.reachability_params,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                             &MachineNextStateResolver,
                             dpu_snapshot,
                             ctx,
@@ -1500,7 +1530,7 @@ impl MachineStateHandler {
                         ctx.services,
                         host_machine_id,
                         HostFirmwareScenario::Ready,
-                        txn,
+                        self.pending_db_writes.as_ref(),
                     )
                     .await?
                 {
@@ -1517,7 +1547,7 @@ impl MachineStateHandler {
             ManagedHostState::Measuring { measuring_state } => handle_measuring_state(
                 measuring_state,
                 &mh_snapshot.host_snapshot.id,
-                txn,
+                &mut ctx.services.db_reader,
                 self.host_handler.host_handler_params.attestation_enabled,
             )
             .await
@@ -1525,7 +1555,7 @@ impl MachineStateHandler {
             ManagedHostState::PostAssignedMeasuring { measuring_state } => handle_measuring_state(
                 measuring_state,
                 &mh_snapshot.host_snapshot.id,
-                txn,
+                &mut ctx.services.db_reader,
                 self.host_handler.host_handler_params.attestation_enabled,
             )
             .await
@@ -1536,7 +1566,7 @@ impl MachineStateHandler {
                 bom_validating_state,
             } => {
                 handle_bom_validation_state(
-                    txn,
+                    self.pending_db_writes.as_ref(),
                     &self.host_handler.host_handler_params,
                     ctx.services,
                     mh_snapshot,
@@ -1547,7 +1577,7 @@ impl MachineStateHandler {
             ManagedHostState::Validation { validation_state } => match validation_state {
                 ValidationState::MachineValidation { machine_validation } => {
                     handle_machine_validation_state(
-                        txn,
+                        self.pending_db_writes.as_ref(),
                         ctx,
                         machine_validation,
                         &self.host_handler.host_handler_params,
@@ -1563,19 +1593,26 @@ impl MachineStateHandler {
         &self,
         state: &ManagedHostStateSnapshot,
         ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
-        txn: &mut PgConnection,
         host_machine_id: &MachineId,
         dpus_for_reprov: &[&Machine],
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         // User approval must have received, otherwise reprovision has not
         // started.
-        if let Err(err) =
-            handler_host_power_control(state, ctx.services, SystemPowerControl::ForceRestart, txn)
-                .await
+        if let Err(err) = handler_host_power_control(
+            state,
+            ctx.services,
+            SystemPowerControl::ForceRestart,
+            &self.pending_db_writes,
+        )
+        .await
         {
             tracing::error!(%host_machine_id, "Host reboot failed with error: {err}");
         }
-        set_managed_host_topology_update_needed(txn, &state.host_snapshot, dpus_for_reprov).await?;
+        set_managed_host_topology_update_needed(
+            &self.pending_db_writes,
+            &state.host_snapshot,
+            dpus_for_reprov,
+        );
 
         let reprov_state = ReprovisionState::next_substate_based_on_bfb_support(
             self.enable_secure_boot,
@@ -1596,7 +1633,6 @@ impl MachineStateHandler {
         managed_state: &ManagedHostState,
         state: &ManagedHostStateSnapshot,
         ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
-        txn: &mut PgConnection,
         host_machine_id: &MachineId,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let mut next_state = None;
@@ -1617,23 +1653,23 @@ impl MachineStateHandler {
                     .handle_restart_dpu_reprovision_assigned_state(
                         state,
                         ctx,
-                        txn,
                         host_machine_id,
                         &dpus_for_reprov,
                     )
                     .await?;
 
-                for dpu in &dpus_for_reprov {
-                    db::machine::clear_failure_details(&dpu.id, txn).await?;
+                for dpu_id in dpus_for_reprov.iter().map(|d| d.id) {
+                    self.pending_db_writes.push(write_op!(|txn| {
+                        db::machine::clear_failure_details(&dpu_id, txn)
+                    }));
                 }
             }
             ManagedHostState::DPUReprovision { .. } => {
                 set_managed_host_topology_update_needed(
-                    txn,
+                    &self.pending_db_writes,
                     &state.host_snapshot,
                     &dpus_for_reprov,
-                )
-                .await?;
+                );
 
                 next_state = Some(
                     ReprovisionState::next_substate_based_on_bfb_support(
@@ -1654,8 +1690,11 @@ impl MachineStateHandler {
         if next_state.is_some() {
             // Restart all DPUs, sit back and relax.
             for dpu in dpus_for_reprov {
-                db::machine::update_dpu_reprovision_start_time(&dpu.id, txn).await?;
-                handler_restart_dpu(dpu, ctx.services, txn).await?;
+                let dpu_id = dpu.id;
+                self.pending_db_writes.push(write_op!(|txn| {
+                    db::machine::update_dpu_reprovision_start_time(&dpu_id, txn)
+                }));
+                handler_restart_dpu(dpu, ctx.services, &self.pending_db_writes).await?;
             }
             return Ok(next_state);
         }
@@ -1703,10 +1742,9 @@ fn dpu_reprovisioning_needed(dpu_snapshots: &[Machine]) -> bool {
         .any(|x| x.reprovision_requested.is_some())
 }
 
-#[allow(txn_held_across_await)]
 async fn handle_restart_verification(
     mh_snapshot: &ManagedHostStateSnapshot,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
 ) -> Result<Option<StateHandlerOutcome<ManagedHostState>>, StateHandlerError> {
     const MAX_VERIFICATION_ATTEMPTS: i32 = 2;
@@ -1719,8 +1757,7 @@ async fn handle_restart_verification(
 
         let host_redfish_client = match ctx
             .services
-            .redfish_client_pool
-            .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+            .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
             .await
         {
             Ok(client) => client,
@@ -1730,14 +1767,17 @@ async fn handle_restart_verification(
                     mh_snapshot.host_snapshot.id,
                     err
                 );
-                update_restart_verification_status(
-                    &mh_snapshot.host_snapshot.id,
-                    last_reboot.clone(),
-                    None,
-                    0,
-                    txn,
-                )
-                .await?;
+                let machine_id = mh_snapshot.host_snapshot.id;
+                let last_reboot = *last_reboot;
+                pending_db_writes.push(write_op!(|txn| {
+                    db::machine::update_restart_verification_status(
+                        &machine_id,
+                        last_reboot,
+                        None,
+                        0,
+                        txn,
+                    )
+                }));
                 return Ok(None); // Skip verification, continue with state transition
             }
         };
@@ -1755,27 +1795,33 @@ async fn handle_restart_verification(
                     mh_snapshot.host_snapshot.id,
                     err
                 );
-                update_restart_verification_status(
-                    &mh_snapshot.host_snapshot.id,
-                    last_reboot.clone(),
-                    None,
-                    0,
-                    txn,
-                )
-                .await?;
+                let machine_id = mh_snapshot.host_snapshot.id;
+                let last_reboot = *last_reboot;
+                pending_db_writes.push(write_op!(|txn| {
+                    db::machine::update_restart_verification_status(
+                        &machine_id,
+                        last_reboot,
+                        None,
+                        0,
+                        txn,
+                    )
+                }));
                 return Ok(None); // Skip verification, continue with state transition
             }
         };
 
         if restart_found {
-            update_restart_verification_status(
-                &mh_snapshot.host_snapshot.id,
-                last_reboot.clone(),
-                Some(true),
-                0,
-                txn,
-            )
-            .await?;
+            let machine_id = mh_snapshot.host_snapshot.id;
+            let last_reboot = *last_reboot;
+            pending_db_writes.push(write_op!(|txn| {
+                db::machine::update_restart_verification_status(
+                    &machine_id,
+                    last_reboot,
+                    Some(true),
+                    0,
+                    txn,
+                )
+            }));
             tracing::info!("Restart verified for host {}", mh_snapshot.host_snapshot.id);
             return Ok(None);
         }
@@ -1789,14 +1835,17 @@ async fn handle_restart_verification(
                     error: e,
                 })?;
 
-            update_restart_verification_status(
-                &mh_snapshot.host_snapshot.id,
-                last_reboot.clone(),
-                None,
-                0,
-                txn,
-            )
-            .await?;
+            let machine_id = mh_snapshot.host_snapshot.id;
+            let last_reboot = *last_reboot;
+            pending_db_writes.push(write_op!(|txn| {
+                db::machine::update_restart_verification_status(
+                    &machine_id,
+                    last_reboot,
+                    None,
+                    0,
+                    txn,
+                )
+            }));
 
             tracing::info!(
                 "Issued force-restart for host {} after {} failed verifications",
@@ -1806,14 +1855,17 @@ async fn handle_restart_verification(
             return Ok(None);
         }
 
-        update_restart_verification_status(
-            &mh_snapshot.host_snapshot.id,
-            last_reboot.clone(),
-            Some(false),
-            verification_attempts + 1,
-            txn,
-        )
-        .await?;
+        let machine_id = mh_snapshot.host_snapshot.id;
+        let last_reboot = *last_reboot;
+        pending_db_writes.push(write_op!(|txn| {
+            db::machine::update_restart_verification_status(
+                &machine_id,
+                last_reboot,
+                Some(false),
+                verification_attempts + 1,
+                txn,
+            )
+        }));
 
         return Ok(Some(StateHandlerOutcome::wait(format!(
             "Waiting for {} force-restart verification - attempt {}/{}",
@@ -1827,15 +1879,14 @@ async fn handle_restart_verification(
     let mut pending_message = Vec::new();
 
     for dpu in &mh_snapshot.dpu_snapshots {
-        if let Some(last_reboot) = &dpu.last_reboot_requested
+        if let Some(last_reboot) = dpu.last_reboot_requested
             && last_reboot.restart_verified == Some(false)
         {
             let verification_attempts = last_reboot.verification_attempts.unwrap_or(0);
 
             let dpu_redfish_client = match ctx
                 .services
-                .redfish_client_pool
-                .create_client_from_machine(dpu, txn)
+                .create_redfish_client_from_machine(dpu)
                 .await
             {
                 Ok(client) => client,
@@ -1845,8 +1896,16 @@ async fn handle_restart_verification(
                         dpu.id,
                         err
                     );
-                    update_restart_verification_status(&dpu.id, last_reboot.clone(), None, 0, txn)
-                        .await?;
+                    let dpu_id = dpu.id;
+                    pending_db_writes.push(write_op!(|txn| {
+                        db::machine::update_restart_verification_status(
+                            &dpu_id,
+                            last_reboot,
+                            None,
+                            0,
+                            txn,
+                        )
+                    }));
                     continue; // Skip verification, continue with state transition
                 }
             };
@@ -1864,21 +1923,33 @@ async fn handle_restart_verification(
                         dpu.id,
                         err
                     );
-                    update_restart_verification_status(&dpu.id, last_reboot.clone(), None, 0, txn)
-                        .await?;
+
+                    let machine_id = dpu.id;
+                    pending_db_writes.push(write_op!(|txn| {
+                        db::machine::update_restart_verification_status(
+                            &machine_id,
+                            last_reboot,
+                            None,
+                            0,
+                            txn,
+                        )
+                    }));
+
                     continue; // Skip verification, continue with state transition
                 }
             };
 
             if restart_found {
-                update_restart_verification_status(
-                    &dpu.id,
-                    last_reboot.clone(),
-                    Some(true),
-                    0,
-                    txn,
-                )
-                .await?;
+                let dpu_id = dpu.id;
+                pending_db_writes.push(write_op!(|txn| {
+                    db::machine::update_restart_verification_status(
+                        &dpu_id,
+                        last_reboot,
+                        Some(true),
+                        0,
+                        txn,
+                    )
+                }));
                 tracing::info!("Restart verified for DPU {}", dpu.id);
             } else if verification_attempts >= MAX_VERIFICATION_ATTEMPTS {
                 dpu_redfish_client
@@ -1889,8 +1960,16 @@ async fn handle_restart_verification(
                         error: e,
                     })?;
 
-                update_restart_verification_status(&dpu.id, last_reboot.clone(), None, 0, txn)
-                    .await?;
+                let dpu_id = dpu.id;
+                pending_db_writes.push(write_op!(|txn| {
+                    db::machine::update_restart_verification_status(
+                        &dpu_id,
+                        last_reboot,
+                        None,
+                        0,
+                        txn,
+                    )
+                }));
 
                 tracing::info!(
                     "Issued force-restart for DPU {} after {} failed verifications",
@@ -1898,14 +1977,17 @@ async fn handle_restart_verification(
                     verification_attempts
                 );
             } else {
-                update_restart_verification_status(
-                    &dpu.id,
-                    last_reboot.clone(),
-                    Some(false),
-                    verification_attempts + 1,
-                    txn,
-                )
-                .await?;
+                let dpu_id = dpu.id;
+                pending_db_writes.push(write_op!(|txn| {
+                    db::machine::update_restart_verification_status(
+                        &dpu_id,
+                        last_reboot,
+                        Some(false),
+                        verification_attempts + 1,
+                        txn,
+                    )
+                }));
+
                 pending_message.push(format!(
                     "DPU {} force-restart verification - attempt {}/{}",
                     dpu.id,
@@ -1992,7 +2074,7 @@ async fn are_dpus_up_trigger_reboot_if_needed(
     state: &ManagedHostStateSnapshot,
     reachability_params: &ReachabilityParams,
     services: &CommonStateHandlerServices,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
 ) -> bool {
     for dpu_snapshot in &state.dpu_snapshots {
         if !is_dpu_up(state, dpu_snapshot) {
@@ -2002,7 +2084,7 @@ async fn are_dpus_up_trigger_reboot_if_needed(
                 None,
                 reachability_params,
                 services,
-                txn,
+                pending_db_writes,
             )
             .await
             {
@@ -2033,8 +2115,7 @@ impl StateHandler for MachineStateHandler {
         mh_snapshot: &mut ManagedHostStateSnapshot,
         _mh_state: &Self::ControllerState, // mh_snapshot above already contains it
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<ManagedHostState>, StateHandlerError> {
-        let mut txn = ctx.services.db_pool.begin().await?;
+    ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         if !mh_snapshot
             .host_snapshot
             .associated_dpu_machine_ids()
@@ -2045,8 +2126,9 @@ impl StateHandler for MachineStateHandler {
                 "No DPU snapshot found."
             )));
         }
+
         self.record_metrics(mh_snapshot, ctx);
-        self.record_health_history(mh_snapshot, &mut txn).await?;
+        self.record_health_history(mh_snapshot);
 
         // Handles power options based on the host's state and configuration settings.
         let PowerHandlingOutcome {
@@ -2062,36 +2144,46 @@ impl StateHandler for MachineStateHandler {
             }
             _ => {
                 if self.power_options_config.enabled {
-                    power::handle_power(mh_snapshot, &mut txn, ctx, &self.power_options_config)
-                        .await?
+                    power::handle_power(
+                        mh_snapshot,
+                        self.pending_db_writes.as_ref(),
+                        ctx,
+                        &self.power_options_config,
+                    )
+                    .await?
                 } else {
                     PowerHandlingOutcome::new(None, true, None)
                 }
             }
         };
 
+        // Clone the pool before we borrow ctx mutably
+        let power_options_pool = ctx.services.db_pool.clone();
+
         let result = if continue_state_machine {
-            self.attempt_state_transition(host_machine_id, mh_snapshot, &mut txn, ctx)
+            self.attempt_state_transition(host_machine_id, mh_snapshot, ctx)
                 .await
-                .map(|o| o.with_txn(Some(txn)))
         } else {
             Ok(StateHandlerOutcome::wait(format!(
                 "State machine can't proceed due to power manager. {}",
                 msg.unwrap_or_default()
-            ))
-            .with_txn(Some(txn)))
+            )))
         };
 
         // Persist power options before returning
         // They are persisted in an individual DB transaction in order to be unaffected
         // by the main state handling outcome
         if let Some(power_options) = power_options {
-            let mut txn = ctx.services.db_pool.begin().await?;
+            let mut txn = power_options_pool.begin().await?;
             db::power_options::persist(&power_options, &mut txn).await?;
             txn.commit().await?;
         }
 
         result
+    }
+
+    async fn take_pending_writes(&self) -> Option<DbWriteBatch> {
+        Some(self.pending_db_writes.take())
     }
 }
 
@@ -2185,20 +2277,17 @@ fn map_host_init_measuring_outcome_to_state_handler_outcome(
     }
 }
 
-#[allow(txn_held_across_await)]
 async fn handle_bfb_install_state(
     state: &ManagedHostStateSnapshot,
     substate: InstallDpuOsState,
     dpu_snapshot: &Machine,
-    txn: &mut PgConnection,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     next_state_resolver: &impl NextState,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let dpu_machine_id = &dpu_snapshot.id.clone();
     let dpu_redfish_client_result = ctx
         .services
-        .redfish_client_pool
-        .create_client_from_machine(dpu_snapshot, txn)
+        .create_redfish_client_from_machine(dpu_snapshot)
         .await;
 
     let dpu_redfish_client = match dpu_redfish_client_result {
@@ -2369,7 +2458,7 @@ fn map_post_assigned_measuring_outcome_to_state_handler_outcome(
 // if everything is ok in general
 async fn check_if_should_redo_measurements(
     machine_id: &MachineId,
-    txn: &mut PgConnection,
+    txn: &mut PgPoolReader,
 ) -> Result<bool, StateHandlerError> {
     let (machine_state, ek_cert_verification_status) =
         get_measuring_prerequisites(machine_id, txn).await?;
@@ -2385,7 +2474,7 @@ async fn check_if_should_redo_measurements(
 
 async fn check_if_not_in_original_failure_cause_anymore(
     machine_id: &MachineId,
-    txn: &mut PgConnection,
+    txn: &mut PgPoolReader,
     original_failure_cause: &FailureCause,
     attestation_enabled: bool,
 ) -> Result<bool, StateHandlerError> {
@@ -2464,12 +2553,11 @@ pub fn identify_dpu(dpu_snapshot: &Machine) -> DpuModel {
 }
 
 /// Handle workflow of DPU reprovision
-#[allow(txn_held_across_await)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_dpu_reprovision(
     state: &ManagedHostStateSnapshot,
     reachability_params: &ReachabilityParams,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     next_state_resolver: &impl NextState,
     dpu_snapshot: &Machine,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
@@ -2491,7 +2579,7 @@ async fn handle_dpu_reprovision(
                 state,
                 dpu_snapshot,
                 substate,
-                txn,
+                pending_db_writes,
                 ctx,
                 dpf_config,
                 reachability_params,
@@ -2504,7 +2592,6 @@ async fn handle_dpu_reprovision(
                 state,
                 substate.clone(),
                 dpu_snapshot,
-                txn,
                 ctx,
                 next_state_resolver,
             )
@@ -2525,7 +2612,7 @@ async fn handle_dpu_reprovision(
                 reachability_params,
                 ctx.services,
                 true,
-                txn,
+                pending_db_writes,
                 dpu_machine_id,
             )
             .await?
@@ -2559,8 +2646,13 @@ async fn handle_dpu_reprovision(
                 ));
             }
 
-            handler_host_power_control(state, ctx.services, SystemPowerControl::ForceOff, txn)
-                .await?;
+            handler_host_power_control(
+                state,
+                ctx.services,
+                SystemPowerControl::ForceOff,
+                pending_db_writes,
+            )
+            .await?;
             Ok(StateHandlerOutcome::transition(
                 next_state_resolver.next_state_with_all_dpus_updated(state, reprovision_state)?,
             ))
@@ -2579,8 +2671,7 @@ async fn handle_dpu_reprovision(
 
             let redfish_client = ctx
                 .services
-                .redfish_client_pool
-                .create_client_from_machine(&state.host_snapshot, txn)
+                .create_redfish_client_from_machine(&state.host_snapshot)
                 .await?;
             let power_state = host_power_state(redfish_client.as_ref()).await?;
 
@@ -2590,8 +2681,13 @@ async fn handle_dpu_reprovision(
                     "Machine {} is still not power-off state. Turning off for host again.",
                     state.host_snapshot.id
                 );
-                handler_host_power_control(state, ctx.services, SystemPowerControl::ForceOff, txn)
-                    .await?;
+                handler_host_power_control(
+                    state,
+                    ctx.services,
+                    SystemPowerControl::ForceOff,
+                    pending_db_writes,
+                )
+                .await?;
 
                 return Ok(StateHandlerOutcome::wait(format!(
                     "Host {} is not still powered off. Trying again.",
@@ -2607,13 +2703,18 @@ async fn handle_dpu_reprovision(
                 .collect_vec();
 
             set_managed_host_topology_update_needed(
-                txn,
+                pending_db_writes,
                 &state.host_snapshot,
                 dpus_snapshots_for_reprov,
+            );
+
+            handler_host_power_control(
+                state,
+                ctx.services,
+                SystemPowerControl::On,
+                pending_db_writes,
             )
             .await?;
-
-            handler_host_power_control(state, ctx.services, SystemPowerControl::On, txn).await?;
             Ok(StateHandlerOutcome::transition(
                 next_state_resolver.next_state_with_all_dpus_updated(state, reprovision_state)?,
             ))
@@ -2622,8 +2723,13 @@ async fn handle_dpu_reprovision(
             next_state_resolver.next_state_with_all_dpus_updated(state, reprovision_state)?,
         )),
         ReprovisionState::VerifyFirmareVersions => {
-            if let Some(outcome) =
-                check_fw_component_version(ctx.services, dpu_snapshot, txn, hardware_models).await?
+            if let Some(outcome) = check_fw_component_version(
+                ctx.services,
+                dpu_snapshot,
+                pending_db_writes,
+                hardware_models,
+            )
+            .await?
             {
                 return Ok(outcome);
             }
@@ -2669,7 +2775,7 @@ async fn handle_dpu_reprovision(
                                 None,
                                 reachability_params,
                                 ctx.services,
-                                txn,
+                                pending_db_writes,
                             )
                             .await?,
                         );
@@ -2696,7 +2802,7 @@ async fn handle_dpu_reprovision(
                                 None,
                                 reachability_params,
                                 ctx.services,
-                                txn,
+                                pending_db_writes,
                             )
                             .await?,
                         );
@@ -2711,9 +2817,10 @@ async fn handle_dpu_reprovision(
 
             // Clear reprovisioning state.
             for dpu_snapshot in &state.dpu_snapshots {
-                db::machine::clear_dpu_reprovisioning_request(txn, &dpu_snapshot.id, false)
-                    .await
-                    .map_err(StateHandlerError::from)?;
+                let dpu_id = dpu_snapshot.id;
+                pending_db_writes.push(write_op!(|txn| {
+                    db::machine::clear_dpu_reprovisioning_request(txn, &dpu_id, false)
+                }))
             }
 
             Ok(StateHandlerOutcome::transition(
@@ -2733,8 +2840,7 @@ async fn handle_dpu_reprovision(
 
                 let redfish_client = ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(&state.host_snapshot, txn)
+                    .create_redfish_client_from_machine(&state.host_snapshot)
                     .await?;
 
                 if let Err(redfish_error) = redfish_client.bmc_reset().await {
@@ -2797,8 +2903,13 @@ async fn handle_dpu_reprovision(
         }
         ReprovisionState::RebootHost => {
             // We can expect transient issues here in case we just rebooted the host's BMC and it has not come up yet
-            handler_host_power_control(state, ctx.services, SystemPowerControl::ForceRestart, txn)
-                .await?;
+            handler_host_power_control(
+                state,
+                ctx.services,
+                SystemPowerControl::ForceRestart,
+                pending_db_writes,
+            )
+            .await?;
 
             // We need to wait for the host to reboot and submit its new Hardware information in
             // case of Ready.
@@ -2825,7 +2936,7 @@ pub async fn try_wait_for_dpu_discovery(
     reachability_params: &ReachabilityParams,
     services: &CommonStateHandlerServices,
     is_reprovision_case: bool,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     current_dpu_machine_id: &MachineId,
 ) -> Result<Option<MachineId>, StateHandlerError> {
     // We are waiting for the `DiscoveryCompleted` RPC call to update the
@@ -2848,7 +2959,7 @@ pub async fn try_wait_for_dpu_discovery(
                     None,
                     reachability_params,
                     services,
-                    txn,
+                    pending_db_writes,
                 )
                 .await?;
             }
@@ -2863,16 +2974,14 @@ pub async fn try_wait_for_dpu_discovery(
 /// Returns Option<StateHandlerOutcome>:
 ///     If Some(_) means at least one fw component is not updated.
 ///     If None: All fw components are updated.
-#[allow(txn_held_across_await)]
 async fn check_fw_component_version(
     services: &CommonStateHandlerServices,
     dpu_snapshot: &Machine,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     hardware_models: &FirmwareConfig,
 ) -> Result<Option<StateHandlerOutcome<ManagedHostState>>, StateHandlerError> {
     let redfish_client = services
-        .redfish_client_pool
-        .create_client_from_machine(dpu_snapshot, txn)
+        .create_redfish_client_from_machine(dpu_snapshot)
         .await?;
 
     let redfish_component_name_map = HashMap::from([
@@ -2987,32 +3096,33 @@ async fn check_fw_component_version(
                 .clone()
                 .firmware_version
                 .is_some_and(|v| v != cur_version)
-            && dpu_snapshot.bmc_addr().is_some()
+            && let Some(dpu_bmc_ip) = dpu_snapshot.bmc_addr().map(|a| a.ip())
         {
-            let mut bios_version: Option<String> =
-                match redfish_client.get_firmware("DPU_UEFI").await {
-                    Ok(uefi) => uefi.version.clone(),
-                    Err(e) => {
-                        tracing::error!("redfish command get_firmware error {}", e.to_string());
-                        None
-                    }
-                };
+            let bios_version: String = redfish_client
+                .get_firmware("DPU_UEFI")
+                .await
+                .inspect_err(|e| {
+                    tracing::error!("redfish command get_firmware error {}", e.to_string());
+                })
+                .ok()
+                .and_then(|uefi| uefi.version)
+                .unwrap_or_else(|| {
+                    dpu_snapshot
+                        .hardware_info
+                        .as_ref()
+                        .and_then(|h| h.dmi_data.as_ref())
+                        .map(|d| d.bios_version.clone())
+                        .unwrap_or_default()
+                });
 
-            if bios_version.is_none() {
-                let hardware_info = dpu_snapshot.hardware_info.clone();
-                bios_version = hardware_info
-                    .as_ref()
-                    .and_then(|h| h.dmi_data.as_ref())
-                    .map(|d| d.bios_version.clone());
-            }
-            db::machine_topology::update_firmware_version_by_bmc_address(
-                txn,
-                &dpu_snapshot.bmc_addr().unwrap().ip(),
-                cur_version.as_str(),
-                bios_version.unwrap_or("".to_string()).as_str(),
-            )
-            .await
-            .map_err(|e| StateHandlerError::FirmwareUpdateError(eyre!(e)))?;
+            pending_db_writes.push(write_op!(|txn| {
+                db::machine_topology::update_firmware_version_by_bmc_address(
+                    txn,
+                    &dpu_bmc_ip,
+                    &cur_version,
+                    &bios_version,
+                )
+            }))
         }
     }
 
@@ -3020,17 +3130,23 @@ async fn check_fw_component_version(
     Ok(None)
 }
 
-async fn set_managed_host_topology_update_needed(
-    txn: &mut PgConnection,
+fn set_managed_host_topology_update_needed(
+    pending_db_writes: &DbWriteBatch,
     host_snapshot: &Machine,
     dpus: &[&Machine],
-) -> Result<(), StateHandlerError> {
+) {
     //Update it for host and DPU both.
     for dpu_snapshot in dpus {
-        db::machine_topology::set_topology_update_needed(txn, &dpu_snapshot.id, true).await?;
+        let dpu_id = dpu_snapshot.id;
+        pending_db_writes.push(write_op!(|txn| {
+            db::machine_topology::set_topology_update_needed(txn, &dpu_id, true)
+        }))
     }
-    db::machine_topology::set_topology_update_needed(txn, &host_snapshot.id, true).await?;
-    Ok(())
+
+    let host_id = host_snapshot.id;
+    pending_db_writes.push(write_op!(|txn| {
+        db::machine_topology::set_topology_update_needed(txn, &host_id, true)
+    }))
 }
 
 /// This function returns failure cause for both host and dpu.
@@ -3062,6 +3178,7 @@ pub struct DpuMachineStateHandler {
     reachability_params: ReachabilityParams,
     enable_secure_boot: bool,
     pub dpf_config: DpfConfig,
+    pending_db_writes: Arc<DbWriteBatch>,
 }
 
 impl DpuMachineStateHandler {
@@ -3071,6 +3188,7 @@ impl DpuMachineStateHandler {
         reachability_params: ReachabilityParams,
         enable_secure_boot: bool,
         dpf_config: DpfConfig,
+        pending_db_writes: Arc<DbWriteBatch>,
     ) -> Self {
         DpuMachineStateHandler {
             dpu_nic_firmware_initial_update_enabled,
@@ -3078,6 +3196,7 @@ impl DpuMachineStateHandler {
             reachability_params,
             enable_secure_boot,
             dpf_config,
+            pending_db_writes,
         }
     }
 
@@ -3115,13 +3234,12 @@ impl DpuMachineStateHandler {
 }
 
 impl DpuMachineStateHandler {
-    #[allow(txn_held_across_await)]
     async fn handle_dpu_discovering_state(
         &self,
         state: &ManagedHostStateSnapshot,
         dpu_snapshot: &Machine,
         _controller_state: &ManagedHostState,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
         ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let dpu_machine_id = &dpu_snapshot.id.clone();
@@ -3142,8 +3260,7 @@ impl DpuMachineStateHandler {
 
         let dpu_redfish_client_result = ctx
             .services
-            .redfish_client_pool
-            .create_client_from_machine(dpu_snapshot, txn)
+            .create_redfish_client_from_machine(dpu_snapshot)
             .await;
 
         let dpu_redfish_client = match dpu_redfish_client_result {
@@ -3266,7 +3383,8 @@ impl DpuMachineStateHandler {
                         // This will kick off the ARM OS install since we move to DPU/Init next.
                         //
                         for dpu_snapshot in &state.dpu_snapshots {
-                            handler_restart_dpu(dpu_snapshot, ctx.services, txn).await?;
+                            handler_restart_dpu(dpu_snapshot, ctx.services, pending_db_writes)
+                                .await?;
                         }
                         DpuInitState::Init
                     };
@@ -3278,12 +3396,10 @@ impl DpuMachineStateHandler {
         }
     }
 
-    #[allow(txn_held_across_await)]
     async fn handle_dpuinit_state(
         &self,
         state: &ManagedHostStateSnapshot,
         dpu_snapshot: &Machine,
-        txn: &mut PgConnection,
         ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let dpu_machine_id = &dpu_snapshot.id;
@@ -3307,7 +3423,6 @@ impl DpuMachineStateHandler {
                     state,
                     substate.clone(),
                     dpu_snapshot,
-                    txn,
                     ctx,
                     &DpuInitNextStateResolver {},
                 )
@@ -3320,7 +3435,7 @@ impl DpuMachineStateHandler {
                     &self.reachability_params,
                     ctx.services,
                     false,
-                    txn,
+                    self.pending_db_writes.as_ref(),
                     dpu_machine_id,
                 )
                 .await?;
@@ -3338,7 +3453,12 @@ impl DpuMachineStateHandler {
 
                 // All DPUs are discovered. Reboot them to proceed.
                 for dpu_snapshot in &state.dpu_snapshots {
-                    handler_restart_dpu(dpu_snapshot, ctx.services, txn).await?;
+                    handler_restart_dpu(
+                        dpu_snapshot,
+                        ctx.services,
+                        self.pending_db_writes.as_ref(),
+                    )
+                    .await?;
                 }
 
                 let machine_state = DpuInitState::WaitingForPlatformPowercycle {
@@ -3353,7 +3473,7 @@ impl DpuMachineStateHandler {
                     state,
                     dpu_snapshot,
                     dpf_state,
-                    txn,
+                    self.pending_db_writes.as_ref(),
                     ctx,
                     &self.dpf_config,
                     &self.reachability_params,
@@ -3373,8 +3493,7 @@ impl DpuMachineStateHandler {
                 // All DPUs are in Off state, turn off the host.
                 let host_redfish_client = ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(&state.host_snapshot, txn)
+                    .create_redfish_client_from_machine(&state.host_snapshot)
                     .await?;
 
                 host_redfish_client
@@ -3397,8 +3516,7 @@ impl DpuMachineStateHandler {
             } => {
                 let host_redfish_client = ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(&state.host_snapshot, txn)
+                    .create_redfish_client_from_machine(&state.host_snapshot)
                     .await?;
 
                 host_redfish_client
@@ -3417,8 +3535,7 @@ impl DpuMachineStateHandler {
             DpuInitState::WaitingForPlatformConfiguration => {
                 let dpu_redfish_client = match ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(dpu_snapshot, txn)
+                    .create_redfish_client_from_machine(dpu_snapshot)
                     .await
                 {
                     Ok(client) => client,
@@ -3436,7 +3553,7 @@ impl DpuMachineStateHandler {
                             None,
                             &self.reachability_params,
                             ctx.services,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?;
 
@@ -3449,7 +3566,7 @@ impl DpuMachineStateHandler {
                 if let Some(outcome) = check_fw_component_version(
                     ctx.services,
                     dpu_snapshot,
-                    txn,
+                    self.pending_db_writes.as_ref(),
                     &self.hardware_models,
                 )
                 .await?
@@ -3492,7 +3609,7 @@ impl DpuMachineStateHandler {
                         None,
                         &self.reachability_params,
                         ctx.services,
-                        txn,
+                        self.pending_db_writes.as_ref(),
                     )
                     .await?;
 
@@ -3519,7 +3636,7 @@ impl DpuMachineStateHandler {
                         None,
                         &self.reachability_params,
                         ctx.services,
-                        txn,
+                        self.pending_db_writes.as_ref(),
                     )
                     .await?;
 
@@ -3531,7 +3648,8 @@ impl DpuMachineStateHandler {
 
                 // We need to reboot the DPU after configuring the BIOS settings appropriately
                 // so that they are applied
-                handler_restart_dpu(dpu_snapshot, ctx.services, txn).await?;
+                handler_restart_dpu(dpu_snapshot, ctx.services, self.pending_db_writes.as_ref())
+                    .await?;
 
                 let next_state = DpuInitState::PollingBiosSetup
                     .next_state(&state.managed_state, dpu_machine_id)?;
@@ -3545,8 +3663,7 @@ impl DpuMachineStateHandler {
 
                 let dpu_redfish_client = match ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(dpu_snapshot, txn)
+                    .create_redfish_client_from_machine(dpu_snapshot)
                     .await
                 {
                     Ok(client) => client,
@@ -3604,7 +3721,7 @@ impl DpuMachineStateHandler {
                                     None,
                                     &self.reachability_params,
                                     ctx.services,
-                                    txn,
+                                    self.pending_db_writes.as_ref(),
                                 )
                                 .await?,
                             );
@@ -3974,23 +4091,8 @@ impl StateHandler for DpuMachineStateHandler {
         state: &mut ManagedHostStateSnapshot,
         _controller_state: &Self::ControllerState,
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<ManagedHostState>, StateHandlerError> {
-        // TODO: Fix txn_held_across_await in handle_object_state_inner, then move it back inline
-        let mut txn = ctx.services.db_pool.begin().await?;
-        let outcome = self.handle_object_state_inner(state, &mut txn, ctx).await?;
-        Ok(outcome.with_txn(Some(txn)))
-    }
-}
-
-impl DpuMachineStateHandler {
-    async fn handle_object_state_inner(
-        &self,
-        state: &mut ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-        ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let mut state_handler_outcome = StateHandlerOutcome::do_nothing();
-
         if state.host_snapshot.associated_dpu_machine_ids().is_empty() {
             let next_state = ManagedHostState::HostInit {
                 machine_state: MachineState::WaitingForPlatformConfiguration,
@@ -3998,9 +4100,7 @@ impl DpuMachineStateHandler {
             Ok(StateHandlerOutcome::transition(next_state))
         } else {
             for dpu_snapshot in &state.dpu_snapshots {
-                state_handler_outcome = self
-                    .handle_dpuinit_state(state, dpu_snapshot, txn, ctx)
-                    .await?;
+                state_handler_outcome = self.handle_dpuinit_state(state, dpu_snapshot, ctx).await?;
 
                 if let outcome @ StateHandlerOutcome::Transition { .. } = state_handler_outcome {
                     return Ok(outcome);
@@ -4009,6 +4109,10 @@ impl DpuMachineStateHandler {
 
             Ok(state_handler_outcome)
         }
+    }
+
+    async fn take_pending_writes(&self) -> Option<DbWriteBatch> {
+        Some(self.pending_db_writes.take())
     }
 }
 
@@ -4067,7 +4171,7 @@ pub fn trigger_reboot_if_needed(
     retry_count: Option<i64>,
     reachability_params: &ReachabilityParams,
     services: &CommonStateHandlerServices,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
 ) -> impl Future<Output = Result<RebootStatus, StateHandlerError>> {
     let trigger_location = std::panic::Location::caller();
     trigger_reboot_if_needed_with_location(
@@ -4076,19 +4180,18 @@ pub fn trigger_reboot_if_needed(
         retry_count,
         reachability_params,
         services,
-        txn,
+        pending_db_writes,
         trigger_location,
     )
 }
 
-#[allow(txn_held_across_await)]
 pub async fn trigger_reboot_if_needed_with_location(
     target: &Machine,
     state: &ManagedHostStateSnapshot,
     retry_count: Option<i64>,
     reachability_params: &ReachabilityParams,
     services: &CommonStateHandlerServices,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     trigger_location: &std::panic::Location<'_>,
 ) -> Result<RebootStatus, StateHandlerError> {
     let host = &state.host_snapshot;
@@ -4124,10 +4227,7 @@ pub async fn trigger_reboot_if_needed_with_location(
             });
         }
 
-        let redfish_client = services
-            .redfish_client_pool
-            .create_client_from_machine(host, txn)
-            .await?;
+        let redfish_client = services.create_redfish_client_from_machine(host).await?;
 
         let power_state = host_power_state(redfish_client.as_ref()).await?;
 
@@ -4145,8 +4245,14 @@ pub async fn trigger_reboot_if_needed_with_location(
         };
 
         tracing::trace!(machine_id=%target.id, "Redfish setting host power state to {action}");
-        handler_host_power_control_with_location(state, services, action, txn, trigger_location)
-            .await?;
+        handler_host_power_control_with_location(
+            state,
+            services,
+            action,
+            pending_db_writes,
+            trigger_location,
+        )
+        .await?;
         return Ok(RebootStatus {
             increase_retry_count: false,
             status: format!("Set power state to {action} using Redfish API"),
@@ -4234,7 +4340,7 @@ pub async fn trigger_reboot_if_needed_with_location(
                     state,
                     services,
                     action,
-                    txn,
+                    pending_db_writes,
                     trigger_location,
                 )
                 .await?;
@@ -4245,13 +4351,13 @@ pub async fn trigger_reboot_if_needed_with_location(
             } else {
                 // Reboot
                 if target.id.machine_type().is_dpu() {
-                    handler_restart_dpu(target, services, txn).await?;
+                    handler_restart_dpu(target, services, pending_db_writes).await?;
                 } else {
                     handler_host_power_control_with_location(
                         state,
                         services,
                         SystemPowerControl::ForceRestart,
-                        txn,
+                        pending_db_writes,
                         trigger_location,
                     )
                     .await?;
@@ -4360,7 +4466,7 @@ fn check_host_health_for_alerts(state: &ManagedHostStateSnapshot) -> Result<(), 
 }
 
 async fn handle_host_boot_order_setup(
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     host_handler_params: HostHandlerParams,
     mh_snapshot: &mut ManagedHostStateSnapshot,
@@ -4373,14 +4479,13 @@ async fn handle_host_boot_order_setup(
 
     let redfish_client = ctx
         .services
-        .redfish_client_pool
-        .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+        .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
         .await?;
 
     let next_state = match set_boot_order_info {
         Some(info) => {
             match set_host_boot_order(
-                txn,
+                pending_db_writes,
                 ctx,
                 &host_handler_params.reachability_params,
                 redfish_client.as_ref(),
@@ -4427,17 +4532,15 @@ async fn handle_host_boot_order_setup(
 }
 
 /// TODO: we need to handle the case where the job is deleted for some reason
-#[allow(txn_held_across_await)]
 async fn handle_host_uefi_setup(
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     state: &mut ManagedHostStateSnapshot,
     uefi_setup_info: UefiSetupInfo,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let redfish_client = ctx
         .services
-        .redfish_client_pool
-        .create_client_from_machine(&state.host_snapshot, txn)
+        .create_redfish_client_from_machine(&state.host_snapshot)
         .await?;
 
     match uefi_setup_info.uefi_setup_state.clone() {
@@ -4547,7 +4650,7 @@ async fn handle_host_uefi_setup(
                 &state.host_snapshot,
                 SystemPowerControl::ForceRestart,
                 ctx.services.ipmi_tool.clone(),
-                txn,
+                pending_db_writes,
             )
             .await
             .map_err(|e| {
@@ -4568,8 +4671,7 @@ async fn handle_host_uefi_setup(
             if let Some(job_id) = uefi_setup_info.uefi_password_jid.clone() {
                 let redfish_client = ctx
                     .services
-                    .redfish_client_pool
-                    .create_client_from_machine(&state.host_snapshot, txn)
+                    .create_redfish_client_from_machine(&state.host_snapshot)
                     .await?;
 
                 let job_state = redfish_client.get_job_state(&job_id).await.map_err(|e| {
@@ -4588,14 +4690,10 @@ async fn handle_host_uefi_setup(
             }
 
             state.host_snapshot.bios_password_set_time = Some(chrono::offset::Utc::now());
-            db::machine::update_bios_password_set_time(&state.host_snapshot.id, txn)
-                .await
-                .map_err(|e| {
-                    StateHandlerError::GenericError(eyre!(
-                        "update_host_bios_password_set failed: {}",
-                        e
-                    ))
-                })?;
+            let machine_id = state.host_snapshot.id;
+            pending_db_writes.push(write_op!(|txn| {
+                db::machine::update_bios_password_set_time(&machine_id, txn)
+            }));
 
             Ok(StateHandlerOutcome::transition(
                 ManagedHostState::HostInit {
@@ -4635,24 +4733,6 @@ impl StateHandler for HostMachineStateHandler {
         mh_snapshot: &mut ManagedHostStateSnapshot,
         _controller_state: &Self::ControllerState,
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<ManagedHostState>, StateHandlerError> {
-        // TODO: Fix txn_held_across_await in handle_object_state_inner, then move it back inline
-        let mut txn = ctx.services.db_pool.begin().await?;
-        let outcome = self
-            .handle_object_state_inner(host_machine_id, mh_snapshot, &mut txn, ctx)
-            .await?;
-        Ok(outcome.with_txn(Some(txn)))
-    }
-}
-
-impl HostMachineStateHandler {
-    #[allow(txn_held_across_await)]
-    async fn handle_object_state_inner(
-        &self,
-        host_machine_id: &MachineId,
-        mh_snapshot: &mut ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-        ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         if let ManagedHostState::HostInit { machine_state } = &mh_snapshot.managed_state {
             match machine_state {
@@ -4663,8 +4743,7 @@ impl HostMachineStateHandler {
                 MachineState::EnableIpmiOverLan => {
                     let host_redfish_client = ctx
                         .services
-                        .redfish_client_pool
-                        .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                        .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                         .await?;
 
                     if !host_redfish_client
@@ -4701,8 +4780,7 @@ impl HostMachineStateHandler {
 
                     let redfish_client = ctx
                         .services
-                        .redfish_client_pool
-                        .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                        .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                         .await?;
 
                     match redfish_client.lockdown_status().await {
@@ -4740,7 +4818,7 @@ impl HostMachineStateHandler {
                     }
 
                     match configure_host_bios(
-                        txn,
+                        self.host_handler_params.pending_db_writes.as_ref(),
                         ctx,
                         &self.host_handler_params.reachability_params,
                         redfish_client.as_ref(),
@@ -4774,8 +4852,7 @@ impl HostMachineStateHandler {
 
                     let redfish_client = ctx
                         .services
-                        .redfish_client_pool
-                        .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                        .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                         .await?;
 
                     let boot_interface_mac = if !mh_snapshot.dpu_snapshots.is_empty() {
@@ -4826,7 +4903,7 @@ impl HostMachineStateHandler {
                 MachineState::SetBootOrder {
                     set_boot_order_info,
                 } => Ok(handle_host_boot_order_setup(
-                    txn,
+                    self.host_handler_params.pending_db_writes.as_ref(),
                     ctx,
                     self.host_handler_params.clone(),
                     mh_snapshot,
@@ -4837,7 +4914,7 @@ impl HostMachineStateHandler {
                     match handle_measuring_state(
                         measuring_state,
                         &mh_snapshot.host_snapshot.id,
-                        txn,
+                        &mut ctx.services.db_reader,
                         self.host_handler_params.attestation_enabled,
                     )
                     .await
@@ -4853,7 +4930,7 @@ impl HostMachineStateHandler {
                             missing: "ek_cert_verification_status",
                         }) => {
                             Ok(StateHandlerOutcome::wait(
-                                "Waiting for Scout to start and send registration info (in discover_machine)".to_string()
+                                "Waiting for Scout to start and send registration info (in discover_machine)".to_string(),
                             ))
                         }
                         Err(e) => Err(e),
@@ -4877,7 +4954,7 @@ impl HostMachineStateHandler {
                             None,
                             &self.host_handler_params.reachability_params,
                             ctx.services,
-                            txn,
+                            self.host_handler_params.pending_db_writes.as_ref(),
                         )
                         .await?;
                         return Ok(StateHandlerOutcome::wait(status.status));
@@ -4894,12 +4971,13 @@ impl HostMachineStateHandler {
                         },
                     ))
                 }
-                MachineState::UefiSetup { uefi_setup_info } => {
-                    Ok(
-                        handle_host_uefi_setup(txn, ctx, mh_snapshot, uefi_setup_info.clone())
-                            .await?,
-                    )
-                }
+                MachineState::UefiSetup { uefi_setup_info } => Ok(handle_host_uefi_setup(
+                    self.host_handler_params.pending_db_writes.as_ref(),
+                    ctx,
+                    mh_snapshot,
+                    uefi_setup_info.clone(),
+                )
+                .await?),
                 MachineState::WaitingForLockdown { lockdown_info } => {
                     match &lockdown_info.state {
                         LockdownState::SetLockdown => {
@@ -4911,8 +4989,7 @@ impl HostMachineStateHandler {
 
                             let redfish_client = ctx
                                 .services
-                                .redfish_client_pool
-                                .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                                .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                                 .await?;
 
                             let action = match lockdown_info.mode {
@@ -4931,7 +5008,7 @@ impl HostMachineStateHandler {
                                 mh_snapshot,
                                 ctx.services,
                                 SystemPowerControl::ForceRestart,
-                                txn,
+                                self.host_handler_params.pending_db_writes.as_ref(),
                             )
                             .await?;
 
@@ -4991,7 +5068,7 @@ impl HostMachineStateHandler {
                                 mh_snapshot,
                                 &self.host_handler_params.reachability_params,
                                 ctx.services,
-                                txn,
+                                self.host_handler_params.pending_db_writes.as_ref(),
                             )
                             .await
                             {
@@ -5005,7 +5082,7 @@ impl HostMachineStateHandler {
                                     mh_snapshot,
                                     ctx.services,
                                     SystemPowerControl::ForceRestart,
-                                    txn,
+                                    self.host_handler_params.pending_db_writes.as_ref(),
                                 )
                                 .await?;
 
@@ -5042,8 +5119,7 @@ impl HostMachineStateHandler {
 
                             let redfish_client = ctx
                                 .services
-                                .redfish_client_pool
-                                .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                                .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                                 .await?;
 
                             match redfish_client.lockdown_status().await {
@@ -5105,7 +5181,7 @@ impl HostMachineStateHandler {
                             None,
                             &self.host_handler_params.reachability_params,
                             ctx.services,
-                            txn,
+                            self.host_handler_params.pending_db_writes.as_ref(),
                         )
                         .await?;
                         Ok(StateHandlerOutcome::wait(format!(
@@ -5122,6 +5198,10 @@ impl HostMachineStateHandler {
             ))
         }
     }
+
+    async fn take_pending_writes(&self) -> Option<DbWriteBatch> {
+        Some(self.host_handler_params.pending_db_writes.take())
+    }
 }
 
 /// A `StateHandler` implementation for instances
@@ -5134,9 +5214,11 @@ pub struct InstanceStateHandler {
     hardware_models: FirmwareConfig,
     enable_secure_boot: bool,
     dpf_config: DpfConfig,
+    pending_db_writes: Arc<DbWriteBatch>,
 }
 
 impl InstanceStateHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         attestation_enabled: bool,
         reachability_params: ReachabilityParams,
@@ -5145,6 +5227,7 @@ impl InstanceStateHandler {
         hardware_models: FirmwareConfig,
         enable_secure_boot: bool,
         dpf_config: DpfConfig,
+        pending_db_writes: Arc<DbWriteBatch>,
     ) -> Self {
         InstanceStateHandler {
             attestation_enabled,
@@ -5154,6 +5237,7 @@ impl InstanceStateHandler {
             hardware_models,
             enable_secure_boot,
             dpf_config,
+            pending_db_writes,
         }
     }
 }
@@ -5171,24 +5255,6 @@ impl StateHandler for InstanceStateHandler {
         mh_snapshot: &mut ManagedHostStateSnapshot,
         _controller_state: &Self::ControllerState,
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<ManagedHostState>, StateHandlerError> {
-        // TODO: Fix txn_held_across_await in handle_object_state_inner, then move it back inline
-        let mut txn = ctx.services.db_pool.begin().await?;
-        let outcome = self
-            .handle_object_state_inner(host_machine_id, mh_snapshot, &mut txn, ctx)
-            .await?;
-        Ok(outcome.with_txn(Some(txn)))
-    }
-}
-
-impl InstanceStateHandler {
-    #[allow(txn_held_across_await)]
-    async fn handle_object_state_inner(
-        &self,
-        host_machine_id: &MachineId,
-        mh_snapshot: &mut ManagedHostStateSnapshot,
-        txn: &mut PgConnection,
-        ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let Some(ref instance) = mh_snapshot.instance else {
             return Err(StateHandlerError::GenericError(eyre!(
@@ -5229,7 +5295,7 @@ impl InstanceStateHandler {
 
                     let network_segments_are_ready =
                         db::network_segment::are_network_segments_ready(
-                            txn,
+                            &mut ctx.services.db_reader,
                             &network_segment_ids_with_vpc,
                         )
                         .await?;
@@ -5251,9 +5317,9 @@ impl InstanceStateHandler {
                     // Check DPU network config has been applied
                     if !mh_snapshot.managed_host_network_config_version_synced() {
                         return Ok(StateHandlerOutcome::wait(
-                            "Waiting for DPU agent(s) to apply network config and report healthy network"
-                                .to_string()
-                        ));
+                                    "Waiting for DPU agent(s) to apply network config and report healthy network"
+                                        .to_string()
+                                ));
                     }
 
                     let next_state = ManagedHostState::Assigned {
@@ -5332,42 +5398,50 @@ impl InstanceStateHandler {
                         return Ok(StateHandlerOutcome::transition(next_state));
                     }
 
-                    let extension_services_status =
-                        get_extension_services_status(mh_snapshot, instance, txn).await?;
+                    let extension_services_status = get_extension_services_status(
+                        mh_snapshot,
+                        instance,
+                        self.pending_db_writes.as_ref(),
+                    );
                     match extension_service::compute_extension_services_readiness(&extension_services_status) {
-                        ExtensionServicesReadiness::Ready => {
-                            let next_state = ManagedHostState::Assigned {
-                                instance_state: InstanceState::WaitingForRebootToReady,
-                            };
-                            Ok(StateHandlerOutcome::transition(next_state))
-                        }
-                        ExtensionServicesReadiness::ConfigsPending => {
-                            Ok(StateHandlerOutcome::wait(
-                                "Waiting for extension services config to be applied on all DPUs.".to_string(),
-                            ))
-                        }
-                        ExtensionServicesReadiness::NotFullyRunning => {
-                            Ok(StateHandlerOutcome::wait(
-                                "Waiting for all active extension services to be running on all DPUs.".to_string(),
-                            ))
-                        }
-                        ExtensionServicesReadiness::SomeTerminating => {
-                            Ok(StateHandlerOutcome::wait(
-                                "Waiting for all terminating extension services to be fully terminated across all DPUs."
-                                    .to_string(),
-                            ))
-                        }
-                    }
+                                ExtensionServicesReadiness::Ready => {
+                                    let next_state = ManagedHostState::Assigned {
+                                        instance_state: InstanceState::WaitingForRebootToReady,
+                                    };
+                                    Ok(StateHandlerOutcome::transition(next_state))
+                                }
+                                ExtensionServicesReadiness::ConfigsPending => {
+                                    Ok(StateHandlerOutcome::wait(
+                                        "Waiting for extension services config to be applied on all DPUs.".to_string(),
+                                    ))
+                                }
+                                ExtensionServicesReadiness::NotFullyRunning => {
+                                    Ok(StateHandlerOutcome::wait(
+                                        "Waiting for all active extension services to be running on all DPUs.".to_string(),
+                                    ))
+                                }
+                                ExtensionServicesReadiness::SomeTerminating => {
+                                    Ok(StateHandlerOutcome::wait(
+                                        "Waiting for all terminating extension services to be fully terminated across all DPUs."
+                                            .to_string(),
+                                    ))
+                                }
+                            }
                 }
                 InstanceState::WaitingForRebootToReady => {
-                    let host_machine_id = &mh_snapshot.host_snapshot.id;
+                    let host_machine_id = mh_snapshot.host_snapshot.id;
 
                     // If custom_pxe_reboot_requested is set, this reboot was triggered by
                     // the tenant requested a boot with custom iPXE. Clear the request flag.
                     // The use_custom_pxe_on_boot flag was already set by the API handler.
                     if instance.custom_pxe_reboot_requested {
-                        db::instance::set_custom_pxe_reboot_requested(host_machine_id, false, txn)
-                            .await?;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            db::instance::set_custom_pxe_reboot_requested(
+                                &host_machine_id,
+                                false,
+                                txn,
+                            )
+                        }));
                     }
 
                     // Reboot host
@@ -5375,7 +5449,7 @@ impl InstanceStateHandler {
                         mh_snapshot,
                         ctx.services,
                         SystemPowerControl::ForceRestart,
-                        txn,
+                        self.pending_db_writes.as_ref(),
                     )
                     .await?;
 
@@ -5455,11 +5529,10 @@ impl InstanceStateHandler {
                         for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                             if dpu_snapshot.reprovision_requested.is_some() {
                                 // User won't be allowed to clear reprovisioning flag after this.
-                                db::machine::update_dpu_reprovision_start_time(
-                                    &dpu_snapshot.id,
-                                    txn,
-                                )
-                                .await?;
+                                let machine_id = dpu_snapshot.id;
+                                self.pending_db_writes.push(write_op!(|txn| {
+                                    db::machine::update_dpu_reprovision_start_time(&machine_id, txn)
+                                }));
                             }
                         }
                         if mh_snapshot
@@ -5467,11 +5540,10 @@ impl InstanceStateHandler {
                             .host_reprovision_requested
                             .is_some()
                         {
-                            db::machine::update_host_reprovision_start_time(
-                                &mh_snapshot.host_snapshot.id,
-                                txn,
-                            )
-                            .await?;
+                            let machine_id = mh_snapshot.host_snapshot.id;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::update_host_reprovision_start_time(&machine_id, txn)
+                            }));
                         }
 
                         // For deletion, power cycle the host first. For everything else
@@ -5479,8 +5551,7 @@ impl InstanceStateHandler {
                         let next_state = if instance.deleted.is_some() {
                             let redfish_client = ctx
                                 .services
-                                .redfish_client_pool
-                                .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+                                .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                                 .await?;
 
                             let power_state = host_power_state(redfish_client.as_ref()).await?;
@@ -5504,29 +5575,33 @@ impl InstanceStateHandler {
 
                         if host_firmware_requested {
                             let health_override =
-                        crate::machine_update_manager::machine_update_module::create_host_update_health_report_hostfw();
+                                        crate::machine_update_manager::machine_update_module::create_host_update_health_report_hostfw();
+                            let machine_id = *host_machine_id;
                             // The health report alert gets generated here, the machine update manager retains responsibilty for clearing it when we're done.
-                            db::machine::insert_health_report_override(
-                                txn,
-                                host_machine_id,
-                                health_report::OverrideMode::Merge,
-                                &health_override,
-                                false,
-                            )
-                            .await?;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::insert_health_report_override(
+                                    txn,
+                                    &machine_id,
+                                    OverrideMode::Merge,
+                                    &health_override,
+                                    false,
+                                )
+                            }));
                         }
 
                         if reprov_can_be_started {
                             let health_override = crate::machine_update_manager::machine_update_module::create_host_update_health_report_dpufw();
+                            let machine_id = *host_machine_id;
                             // Mark the Host as in update.
-                            db::machine::insert_health_report_override(
-                                txn,
-                                host_machine_id,
-                                health_report::OverrideMode::Merge,
-                                &health_override,
-                                false,
-                            )
-                            .await?;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::insert_health_report_override(
+                                    txn,
+                                    &machine_id,
+                                    OverrideMode::Merge,
+                                    &health_override,
+                                    false,
+                                )
+                            }));
                         }
 
                         Ok(StateHandlerOutcome::transition(next_state))
@@ -5538,7 +5613,7 @@ impl InstanceStateHandler {
                     platform_config_state,
                 } => {
                     handle_instance_host_platform_config(
-                        txn,
+                        self.pending_db_writes.as_ref(),
                         ctx,
                         mh_snapshot,
                         &self.reachability_params,
@@ -5551,7 +5626,7 @@ impl InstanceStateHandler {
                         mh_snapshot,
                         &self.reachability_params,
                         ctx.services,
-                        txn,
+                        self.pending_db_writes.as_ref(),
                     )
                     .await
                     {
@@ -5578,7 +5653,7 @@ impl InstanceStateHandler {
                             mh_snapshot,
                             ctx.services,
                             SystemPowerControl::ForceRestart,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?;
                         let next_state = ManagedHostState::Assigned {
@@ -5598,7 +5673,7 @@ impl InstanceStateHandler {
                             Some(retry.count as i64 + 1),
                             &self.reachability_params,
                             ctx.services,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?;
 
@@ -5640,17 +5715,21 @@ impl InstanceStateHandler {
                         let mut dpus_for_reprov = vec![];
                         for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                             if dpu_snapshot.reprovision_requested.is_some() {
-                                handler_restart_dpu(dpu_snapshot, ctx.services, txn).await?;
+                                handler_restart_dpu(
+                                    dpu_snapshot,
+                                    ctx.services,
+                                    self.pending_db_writes.as_ref(),
+                                )
+                                .await?;
                                 dpus_for_reprov.push(dpu_snapshot);
                             }
                         }
 
                         set_managed_host_topology_update_needed(
-                            txn,
+                            self.pending_db_writes.as_ref(),
                             &mh_snapshot.host_snapshot,
                             &dpus_for_reprov,
-                        )
-                        .await?;
+                        );
 
                         let next_state = ReprovisionState::next_substate_based_on_bfb_support(
                             self.enable_secure_boot,
@@ -5690,13 +5769,15 @@ impl InstanceStateHandler {
                     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                         let (mut netconf, version) = dpu_snapshot.network_config.clone().take();
                         netconf.use_admin_network = Some(true);
-                        db::machine::try_update_network_config(
-                            txn,
-                            &dpu_snapshot.id,
-                            version,
-                            &netconf,
-                        )
-                        .await?;
+                        let dpu_snapshot_id = dpu_snapshot.id;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            db::machine::try_update_network_config(
+                                txn,
+                                &dpu_snapshot_id,
+                                version,
+                                &netconf,
+                            )
+                        }));
                     }
 
                     // Machine is currently an instance, but the instance is being released and we
@@ -5706,13 +5787,15 @@ impl InstanceStateHandler {
                     for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
                         let (mut netconf, version) = dpa_interface.network_config.clone().take();
                         netconf.use_admin_network = Some(true);
-                        db::dpa_interface::try_update_network_config(
-                            txn,
-                            &dpa_interface.id,
-                            version,
-                            &netconf,
-                        )
-                        .await?;
+                        let dpa_interface_id = dpa_interface.id;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            db::dpa_interface::try_update_network_config(
+                                txn,
+                                &dpa_interface_id,
+                                version,
+                                &netconf,
+                            )
+                        }));
                     }
 
                     let next_state = ManagedHostState::Assigned {
@@ -5725,9 +5808,9 @@ impl InstanceStateHandler {
                     // we are back on the admin network?
                     if !mh_snapshot.managed_host_network_config_version_synced() {
                         return Ok(StateHandlerOutcome::wait(
-                            "Waiting for DPU agent(s) to apply network config and report healthy network"
-                                .to_string()
-                        ));
+                                    "Waiting for DPU agent(s) to apply network config and report healthy network"
+                                        .to_string()
+                                ));
                     }
 
                     // Check if all DPUs have terminated all extension services
@@ -5748,9 +5831,9 @@ impl InstanceStateHandler {
                                     != ExtensionServiceDeploymentStatus::Terminated
                                 {
                                     return Ok(StateHandlerOutcome::wait(
-                                            "Waiting for extension services to be terminated on all DPUs."
-                                                .to_string()
-                                        ));
+                                                "Waiting for extension services to be terminated on all DPUs."
+                                                    .to_string()
+                                            ));
                                 }
                             }
                         }
@@ -5762,9 +5845,9 @@ impl InstanceStateHandler {
                         for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
                             if !dpa_interface.managed_host_network_config_version_synced() {
                                 return Ok(StateHandlerOutcome::wait(
-                                "Waiting for DPA agent(s) to apply network config and report healthy network"
-                                    .to_string()
-                            ));
+                                            "Waiting for DPA agent(s) to apply network config and report healthy network"
+                                                .to_string()
+                                        ));
                             }
                         }
                     }
@@ -5819,14 +5902,16 @@ impl InstanceStateHandler {
                             };
 
                             // Use health report override instead of state_controller_health_report field
-                            db::machine::insert_health_report_override(
-                                txn,
-                                host_machine_id,
-                                OverrideMode::Merge,
-                                &health_report,
-                                false, // no_overwrite = false (we want to update if exists)
-                            )
-                            .await?;
+                            let host_machine_id = *host_machine_id;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::machine::insert_health_report_override(
+                                    txn,
+                                    &host_machine_id,
+                                    health_report::OverrideMode::Merge,
+                                    &health_report,
+                                    false,
+                                )
+                            }));
 
                             tracing::info!(
                                 machine_id = %host_machine_id,
@@ -5850,7 +5935,7 @@ impl InstanceStateHandler {
                         mh_snapshot,
                         ctx.services,
                         SystemPowerControl::ForceRestart,
-                        txn,
+                        self.pending_db_writes.as_ref(),
                     )
                     .await?;
 
@@ -5861,18 +5946,21 @@ impl InstanceStateHandler {
                     // details are stored in instance's network config which is deleted.
 
                     // Delete from database now. Once done, reboot and move to next state.
-                    db::instance::delete(instance.id, txn)
-                        .await
-                        .map_err(|err| StateHandlerError::GenericError(err.into()))?;
+                    let instance_id = instance.id;
+                    self.pending_db_writes
+                        .push(write_op!(|txn| db::instance::delete(instance_id, txn)));
 
                     release_network_segments_with_vpc_prefix(
                         &instance.config.network.interfaces,
-                        txn,
-                    )
-                    .await?;
+                        self.pending_db_writes.as_ref(),
+                    );
 
                     // Free up all loopback IPs allocated for this instance.
-                    release_vpc_dpu_loopback(mh_snapshot, &self.common_pools, txn).await?;
+                    release_vpc_dpu_loopback(
+                        mh_snapshot,
+                        &self.common_pools,
+                        self.pending_db_writes.as_ref(),
+                    );
 
                     let next_state = if self.attestation_enabled {
                         ManagedHostState::PostAssignedMeasuring {
@@ -5892,7 +5980,7 @@ impl InstanceStateHandler {
                             handle_dpu_reprovision(
                                 mh_snapshot,
                                 &self.reachability_params,
-                                txn,
+                                self.pending_db_writes.as_ref(),
                                 &InstanceNextStateResolver,
                                 dpu_snapshot,
                                 ctx,
@@ -5931,7 +6019,7 @@ impl InstanceStateHandler {
                             ctx.services,
                             host_machine_id,
                             HostFirmwareScenario::Instance,
-                            txn,
+                            self.pending_db_writes.as_ref(),
                         )
                         .await?
                     {
@@ -5947,7 +6035,8 @@ impl InstanceStateHandler {
                         mh_snapshot,
                         network_config_update_state,
                         instance,
-                        txn,
+                        self.pending_db_writes.as_ref(),
+                        ctx.services,
                         &self.common_pools,
                     )
                     .await
@@ -5964,13 +6053,15 @@ impl InstanceStateHandler {
                             let (mut netconf, version) =
                                 dpa_interface.network_config.clone().take();
                             netconf.use_admin_network = Some(false);
-                            db::dpa_interface::try_update_network_config(
-                                txn,
-                                &dpa_interface.id,
-                                version,
-                                &netconf,
-                            )
-                            .await?;
+                            let dpa_interface_id = dpa_interface.id;
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                db::dpa_interface::try_update_network_config(
+                                    txn,
+                                    &dpa_interface_id,
+                                    version,
+                                    &netconf,
+                                )
+                            }));
                         }
                     }
                     let next_state = ManagedHostState::Assigned {
@@ -5987,9 +6078,9 @@ impl InstanceStateHandler {
                         for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
                             if !dpa_interface.managed_host_network_config_version_synced() {
                                 return Ok(StateHandlerOutcome::wait(
-                                "Waiting for DPA agent(s) to apply network config and report healthy network"
-                                    .to_string()
-                            ));
+                                            "Waiting for DPA agent(s) to apply network config and report healthy network"
+                                                .to_string()
+                                        ));
                             }
                         }
                     }
@@ -5998,13 +6089,10 @@ impl InstanceStateHandler {
                     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                         let (mut netconf, version) = dpu_snapshot.network_config.clone().take();
                         netconf.use_admin_network = Some(false);
-                        db::machine::try_update_network_config(
-                            txn,
-                            &dpu_snapshot.id,
-                            version,
-                            &netconf,
-                        )
-                        .await?;
+                        let dpu_id = dpu_snapshot.id;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            db::machine::try_update_network_config(txn, &dpu_id, version, &netconf)
+                        }));
                     }
 
                     let next_state = ManagedHostState::Assigned {
@@ -6018,15 +6106,19 @@ impl InstanceStateHandler {
             Ok(StateHandlerOutcome::do_nothing())
         }
     }
+
+    async fn take_pending_writes(&self) -> Option<DbWriteBatch> {
+        Some(self.pending_db_writes.take())
+    }
 }
 
 // Gets extension services status from DB, checks if any removed services are fully terminated
 // across all DPUs, if so, remove them from the instance config in the DB(without updating the version).
-async fn get_extension_services_status(
+fn get_extension_services_status(
     mh_snapshot: &ManagedHostStateSnapshot,
     instance: &InstanceSnapshot,
-    txn: &mut PgConnection,
-) -> Result<InstanceExtensionServicesStatus, StateHandlerError> {
+    pending_db_writes: &DbWriteBatch,
+) -> InstanceExtensionServicesStatus {
     let (_, dpu_id_to_device_map) = mh_snapshot
         .host_snapshot
         .get_dpu_device_and_id_mappings()
@@ -6051,20 +6143,22 @@ async fn get_extension_services_status(
                 service_ids = ?terminated_service_ids,
                 "Cleaning up fully terminated extension services from instance config"
             );
-
+            let instance_id = instance.id;
+            let expected_version = instance.extension_services_config_version;
             let new_config = instance
                 .config
                 .extension_services
                 .remove_terminated_services(&terminated_service_ids);
 
-            db::instance::update_extension_services_config(
-                txn,
-                instance.id,
-                instance.extension_services_config_version,
-                &new_config,
-                false,
-            )
-            .await?;
+            pending_db_writes.push(write_op!(|txn| {
+                db::instance::update_extension_services_config(
+                    txn,
+                    instance_id,
+                    expected_version,
+                    &new_config,
+                    false,
+                )
+            }));
 
             extension_services_status
                 .extension_services
@@ -6072,14 +6166,15 @@ async fn get_extension_services_status(
         }
     }
 
-    Ok(extension_services_status)
+    extension_services_status
 }
 
 async fn handle_instance_network_config_update_request(
     mh_snapshot: &ManagedHostStateSnapshot,
     network_config_update_state: &NetworkConfigUpdateState,
     instance: &InstanceSnapshot,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
+    services: &mut CommonStateHandlerServices,
     common_pools: &Option<Arc<CommonPools>>,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     match network_config_update_state {
@@ -6110,7 +6205,7 @@ async fn handle_instance_network_config_update_request(
             // No network segment is configured with vpc_prefix_id.
             if !network_segment_ids_with_vpc.is_empty() {
                 let network_segments_are_ready = db::network_segment::are_network_segments_ready(
-                    txn,
+                    &mut services.db_reader,
                     &network_segment_ids_with_vpc,
                 )
                 .await?;
@@ -6122,14 +6217,16 @@ async fn handle_instance_network_config_update_request(
             }
 
             // Update requested network config and increment version.
-            db::instance::update_network_config(
+            let instance_id = instance.id;
+            let expected_version = instance.network_config_version;
+            let new_state = update_request.new_config.clone();
+            pending_db_writes.push(write_op!(|txn| db::instance::update_network_config(
                 txn,
-                instance.id,
-                instance.network_config_version,
-                &update_request.new_config,
+                instance_id,
+                expected_version,
+                &new_state,
                 true,
-            )
-            .await?;
+            )));
 
             Ok(StateHandlerOutcome::transition(next_state))
         }
@@ -6189,7 +6286,7 @@ async fn handle_instance_network_config_update_request(
             if !resources_to_be_released.is_empty() {
                 let addresses = resources_to_be_released
                     .iter()
-                    .flat_map(|x| x.ip_addrs.values().collect_vec())
+                    .flat_map(|x| x.ip_addrs.values().copied().collect_vec())
                     .collect_vec();
 
                 tracing::info!(
@@ -6197,8 +6294,13 @@ async fn handle_instance_network_config_update_request(
                     instance.id,
                     addresses,
                 );
-                db::instance_address::delete_addresses(txn, &addresses).await?;
-                release_network_segments_with_vpc_prefix(&resources_to_be_released, txn).await?;
+                pending_db_writes.push(write_op!(|txn| db::instance_address::delete_addresses(
+                    txn, &addresses
+                )));
+                release_network_segments_with_vpc_prefix(
+                    &resources_to_be_released,
+                    pending_db_writes,
+                );
 
                 // TODO: This is not the best way, but will work fine. If you delete all loopback IPs
                 // associated with all DPUs, dpu_agent will assign new IPs during next managed_host_network_config
@@ -6206,9 +6308,12 @@ async fn handle_instance_network_config_update_request(
                 // The best way would be to find out the VPCs per DPU which are not used in new config
                 // and delete them only. This can be taken care once multi-dpu instance allocation is
                 // completed.
-                release_vpc_dpu_loopback(mh_snapshot, common_pools, txn).await?;
+                release_vpc_dpu_loopback(mh_snapshot, common_pools, pending_db_writes);
             }
-            db::instance::delete_update_network_config_request(&instance.id, txn).await?;
+            let instance_id = instance.id;
+            pending_db_writes.push(write_op!(|txn| {
+                db::instance::delete_update_network_config_request(&instance_id, txn)
+            }));
             let next_state = ManagedHostState::Assigned {
                 instance_state: InstanceState::Ready,
             };
@@ -6369,29 +6474,30 @@ fn check_instance_network_synced_and_dpu_healthy(
     Ok(InstanceNetworkSyncStatus::InstanceNetworkSynced)
 }
 
-pub async fn release_vpc_dpu_loopback(
+pub fn release_vpc_dpu_loopback(
     mh_snapshot: &ManagedHostStateSnapshot,
     common_pools: &Option<Arc<CommonPools>>,
-    txn: &mut PgConnection,
-) -> Result<(), StateHandlerError> {
+    pending_db_writes: &DbWriteBatch,
+) {
     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
         if let Some(common_pools) = common_pools {
-            db::vpc_dpu_loopback::delete_and_deallocate(common_pools, &dpu_snapshot.id, txn, false)
-                .await
-                .map_err(|e| StateHandlerError::ResourceCleanupError {
-                    resource: "VpcLoopbackIp",
-                    error: e.to_string(),
-                })?;
+            let common_pools = common_pools.clone();
+            let dpu_id = dpu_snapshot.id;
+            pending_db_writes.push(write_op!(|txn| {
+                db::vpc_dpu_loopback::delete_and_deallocate(&common_pools, &dpu_id, txn, false)
+                    .map_err(|e| StateHandlerError::ResourceCleanupError {
+                        resource: "VpcLoopbackIp",
+                        error: e.to_string(),
+                    })
+            }));
         }
     }
-
-    Ok(())
 }
 
-async fn release_network_segments_with_vpc_prefix(
+fn release_network_segments_with_vpc_prefix(
     interfaces: &[InstanceInterfaceConfig],
-    txn: &mut PgConnection,
-) -> Result<(), StateHandlerError> {
+    pending_db_writes: &DbWriteBatch,
+) {
     let network_segment_ids_with_vpc = interfaces
         .iter()
         .filter_map(|x| match x.network_details {
@@ -6402,15 +6508,14 @@ async fn release_network_segments_with_vpc_prefix(
 
     // Mark all network ready for delete which were created for vpc_prefixes.
     if !network_segment_ids_with_vpc.is_empty() {
-        db::network_segment::mark_as_deleted_no_validation(txn, &network_segment_ids_with_vpc)
-            .await
-            .map_err(|err| StateHandlerError::ResourceCleanupError {
-                resource: "network_segment",
-                error: err.to_string(),
-            })?;
+        pending_db_writes.push(write_op!(|txn| {
+            db::network_segment::mark_as_deleted_no_validation(txn, &network_segment_ids_with_vpc)
+                .map_err(|err| StateHandlerError::ResourceCleanupError {
+                    resource: "network_segment",
+                    error: err.to_string(),
+                })
+        }))
     }
-
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -6484,10 +6589,10 @@ impl HostUpgradeState {
     async fn handle_host_reprovision(
         &self,
         state: &mut ManagedHostStateSnapshot,
-        services: &CommonStateHandlerServices,
+        services: &mut CommonStateHandlerServices,
         machine_id: &MachineId,
         scenario: HostFirmwareScenario,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         // Treat Ready (but flagged to do updates) the same as HostReprovisionState/CheckingFirmware
         let original_state = &state.managed_state.clone();
@@ -6547,8 +6652,10 @@ impl HostUpgradeState {
                 },
                 retry_count: 0,
             };
-            db::host_machine_update::reset_host_reprovisioning_request(txn, machine_id, true)
-                .await?;
+            let machine_id = *machine_id;
+            pending_db_writes.push(write_op!(|txn| {
+                db::host_machine_update::reset_host_reprovisioning_request(txn, &machine_id, true)
+            }));
         }
 
         match host_reprovision_state {
@@ -6563,7 +6670,7 @@ impl HostUpgradeState {
                     original_state,
                     scenario,
                     false,
-                    txn,
+                    pending_db_writes,
                 )
                 .await
             }
@@ -6578,7 +6685,7 @@ impl HostUpgradeState {
                     original_state,
                     scenario,
                     false,
-                    txn,
+                    pending_db_writes,
                 )
                 .await
             }
@@ -6590,7 +6697,7 @@ impl HostUpgradeState {
                     original_state,
                     scenario,
                     false,
-                    txn,
+                    pending_db_writes,
                 )
                 .await
             }
@@ -6602,7 +6709,7 @@ impl HostUpgradeState {
                     original_state,
                     scenario,
                     true,
-                    txn,
+                    pending_db_writes,
                 )
                 .await
             }
@@ -6619,26 +6726,49 @@ impl HostUpgradeState {
                     scenario,
                     Some(phase.clone()),
                     &Some(*last_time),
-                    txn,
                 )
                 .await
             }
             details @ HostReprovisionState::WaitingForUpload { .. } => {
-                self.waiting_for_upload(details, state, scenario, txn).await
+                self.waiting_for_upload(
+                    details,
+                    state,
+                    scenario,
+                    &mut services.db_reader,
+                    pending_db_writes,
+                )
+                .await
             }
             details @ HostReprovisionState::WaitingForFirmwareUpgrade { .. } => {
-                self.host_waiting_fw(details, state, services, machine_id, scenario, txn)
-                    .await
+                self.host_waiting_fw(
+                    details,
+                    state,
+                    services,
+                    machine_id,
+                    scenario,
+                    pending_db_writes,
+                )
+                .await
             }
             details @ HostReprovisionState::ResetForNewFirmware { .. } => {
                 self.host_reset_for_new_firmware(
-                    state, services, machine_id, details, scenario, txn,
+                    state,
+                    services,
+                    machine_id,
+                    details,
+                    scenario,
+                    pending_db_writes,
                 )
                 .await
             }
             details @ HostReprovisionState::NewFirmwareReportedWait { .. } => {
                 self.host_new_firmware_reported_wait(
-                    state, services, details, machine_id, scenario, txn,
+                    state,
+                    services,
+                    details,
+                    machine_id,
+                    scenario,
+                    pending_db_writes,
                 )
                 .await
             }
@@ -6673,15 +6803,23 @@ impl HostUpgradeState {
         &self,
         details: &HostReprovisionState,
         state: &ManagedHostStateSnapshot,
-        services: &CommonStateHandlerServices,
+        services: &mut CommonStateHandlerServices,
         original_state: &ManagedHostState,
         scenario: HostFirmwareScenario,
         repeat: bool,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
-        let machine_id = &state.host_snapshot.id;
+        let machine_id = state.host_snapshot.id;
         let mut ret = self
-            .host_checking_fw_noclear(details, state, services, machine_id, scenario, repeat, txn)
+            .host_checking_fw_noclear(
+                details,
+                state,
+                services,
+                &machine_id,
+                scenario,
+                repeat,
+                pending_db_writes,
+            )
             .await?;
 
         // Check if we are returning to the ready state, and clear the host reprovisioning request if so.
@@ -6692,14 +6830,17 @@ impl HostUpgradeState {
                     instance_state: InstanceState::HostReprovision { .. },
                 } => {}
                 _ => {
-                    db::host_machine_update::clear_host_reprovisioning_request(txn, machine_id)
-                        .await?;
+                    pending_db_writes.push(write_op!(|txn| {
+                        db::host_machine_update::clear_host_reprovisioning_request(txn, &machine_id)
+                    }));
 
                     // TODO: Remove when manual upgrade feature is removed
-                    db::host_machine_update::clear_manual_firmware_upgrade_completed(
-                        txn, machine_id,
-                    )
-                    .await?;
+                    pending_db_writes.push(write_op!(|txn| {
+                        db::host_machine_update::clear_manual_firmware_upgrade_completed(
+                            txn,
+                            &machine_id,
+                        )
+                    }));
                 }
             };
         }
@@ -6714,17 +6855,16 @@ impl HostUpgradeState {
         Ok(ret)
     }
 
-    #[allow(txn_held_across_await)]
     #[allow(clippy::too_many_arguments)]
     async fn host_checking_fw_noclear(
         &self,
         details: &HostReprovisionState,
         state: &ManagedHostStateSnapshot,
-        services: &CommonStateHandlerServices,
+        services: &mut CommonStateHandlerServices,
         machine_id: &MachineId,
         scenario: HostFirmwareScenario,
         repeat: bool,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         // temporary check if manual upgrade is required before proceeding with automatic ones,
         // should be removed once we complete upgrades through the scout.
@@ -6759,8 +6899,13 @@ impl HostUpgradeState {
                 }
             };
 
-        let Some(explored_endpoint) =
-            find_explored_refreshed_endpoint(state, machine_id, txn).await?
+        let Some(explored_endpoint) = find_explored_refreshed_endpoint(
+            state,
+            machine_id,
+            &mut services.db_reader,
+            pending_db_writes,
+        )
+        .await?
         else {
             // find_explored_refreshed_endpoint's behavior is to return None to indicate we're waiting for an update, not to indicate there isn't anything.
 
@@ -6796,7 +6941,7 @@ impl HostUpgradeState {
             {
                 if to_install.script.is_some() {
                     return self
-                        .by_script(to_install, state, explored_endpoint, scenario, txn)
+                        .by_script(to_install, state, explored_endpoint, scenario)
                         .await;
                 }
                 tracing::info!(%machine_id,
@@ -6808,7 +6953,7 @@ impl HostUpgradeState {
 
                 if !repeat && to_install.pre_update_resets {
                     return self
-                        .pre_update_resets(state, services, scenario, None, &None, txn)
+                        .pre_update_resets(state, services, scenario, None, &None)
                         .await;
                 }
 
@@ -6824,7 +6969,7 @@ impl HostUpgradeState {
                             firmware_number: &firmware_number,
                         },
                         scenario,
-                        txn,
+                        pending_db_writes,
                     )
                     .await;
             }
@@ -6833,8 +6978,7 @@ impl HostUpgradeState {
         // Nothing needs updates, return to ready.  But first, we may need to reenable lockdown.
 
         let redfish_client = services
-            .redfish_client_pool
-            .create_client_from_machine(&state.host_snapshot, txn)
+            .create_redfish_client_from_machine(&state.host_snapshot)
             .await?;
 
         let lockdown_disabled = match redfish_client.lockdown_status().await {
@@ -6875,7 +7019,7 @@ impl HostUpgradeState {
                         state,
                         services,
                         SystemPowerControl::ForceRestart,
-                        txn,
+                        pending_db_writes,
                     )
                     .await?;
                     scenario.complete_state()
@@ -6884,21 +7028,24 @@ impl HostUpgradeState {
         } else {
             tracing::debug!("host firmware update: Don't need to reenable lockdown");
             if let HostFirmwareScenario::Instance = scenario {
-                handler_host_power_control(state, services, SystemPowerControl::ForceRestart, txn)
-                    .await?;
+                handler_host_power_control(
+                    state,
+                    services,
+                    SystemPowerControl::ForceRestart,
+                    pending_db_writes,
+                )
+                .await?;
             }
             scenario.complete_state()
         }
     }
 
-    #[allow(txn_held_across_await)]
     async fn by_script(
         &self,
         to_install: FirmwareEntry,
         state: &ManagedHostStateSnapshot,
         explored_endpoint: ExploredEndpoint,
         scenario: HostFirmwareScenario,
-        _txn: &mut PgConnection,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let machine_id = state.host_snapshot.id;
 
@@ -7087,7 +7234,6 @@ impl HostUpgradeState {
         }
     }
 
-    #[allow(txn_held_across_await)]
     async fn pre_update_resets(
         &self,
         state: &ManagedHostStateSnapshot,
@@ -7095,11 +7241,9 @@ impl HostUpgradeState {
         scenario: HostFirmwareScenario,
         phase: Option<InitialResetPhase>,
         last_time: &Option<DateTime<Utc>>,
-        txn: &mut PgConnection,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let redfish_client = services
-            .redfish_client_pool
-            .create_client_from_machine(&state.host_snapshot, txn)
+            .create_redfish_client_from_machine(&state.host_snapshot)
             .await?;
 
         match phase.unwrap_or(InitialResetPhase::Start) {
@@ -7190,7 +7334,6 @@ impl HostUpgradeState {
         }
     }
     /// Uploads a firmware update via multipart, returning the task ID, or None if upload was deferred
-    #[allow(txn_held_across_await)]
     async fn initiate_host_fw_update(
         &self,
         address: IpAddr,
@@ -7198,7 +7341,7 @@ impl HostUpgradeState {
         services: &CommonStateHandlerServices,
         fw_info: FullFirmwareInfo<'_>,
         scenario: HostFirmwareScenario,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let snapshot = &state.host_snapshot;
         let to_install = fw_info.to_install;
@@ -7229,8 +7372,7 @@ impl HostUpgradeState {
 
         // Setup the Redfish connection
         let redfish_client = services
-            .redfish_client_pool
-            .create_client_from_machine(snapshot, txn)
+            .create_redfish_client_from_machine(snapshot)
             .await?;
 
         let lockdown_disabled = match redfish_client.lockdown_status().await {
@@ -7263,8 +7405,13 @@ impl HostUpgradeState {
             }
             if fw_info.model == "Dell" {
                 tracing::info!(%address, "Host fw update: Rebooting after disabling lockdown because Dell");
-                handler_host_power_control(state, services, SystemPowerControl::ForceRestart, txn)
-                    .await?;
+                handler_host_power_control(
+                    state,
+                    services,
+                    SystemPowerControl::ForceRestart,
+                    pending_db_writes,
+                )
+                .await?;
                 // Wait until the next state machine iteration to let it restart
                 return Ok(None);
             }
@@ -7301,13 +7448,13 @@ impl HostUpgradeState {
         )
     }
 
-    #[allow(txn_held_across_await)]
     async fn waiting_for_upload(
         &self,
         details: &HostReprovisionState,
         state: &ManagedHostStateSnapshot,
         scenario: HostFirmwareScenario,
-        txn: &mut PgConnection,
+        db_reader: &mut PgPoolReader,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let (final_version, firmware_type, power_drains_needed, firmware_number) = match details {
             HostReprovisionState::WaitingForUpload {
@@ -7329,7 +7476,14 @@ impl HostUpgradeState {
         };
 
         let machine_id = state.host_snapshot.id;
-        let address = match find_explored_refreshed_endpoint(state, &machine_id, txn).await {
+        let address = match find_explored_refreshed_endpoint(
+            state,
+            &machine_id,
+            db_reader,
+            pending_db_writes,
+        )
+        .await
+        {
             Ok(explored_endpoint) => match explored_endpoint {
                 Some(explored_endpoint) => explored_endpoint.address.to_string(),
                 None => "unknown".to_string(),
@@ -7396,15 +7550,14 @@ impl HostUpgradeState {
         }
     }
 
-    #[allow(txn_held_across_await)]
     async fn host_waiting_fw(
         &self,
         details: &HostReprovisionState,
         state: &ManagedHostStateSnapshot,
-        services: &CommonStateHandlerServices,
+        services: &mut CommonStateHandlerServices,
         machine_id: &MachineId,
         scenario: HostFirmwareScenario,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let (
             task_id,
@@ -7447,8 +7600,7 @@ impl HostUpgradeState {
             .map_err(StateHandlerError::GenericError)?;
         // Setup the Redfish connection
         let redfish_client = services
-            .redfish_client_pool
-            .create_client_from_machine(&state.host_snapshot, txn)
+            .create_redfish_client_from_machine(&state.host_snapshot)
             .await?;
 
         match redfish_client.get_task(task_id.as_str()).await {
@@ -7470,8 +7622,13 @@ impl HostUpgradeState {
                         // Task has completed, update is done and we can clean up.  Site explorer will ingest this next time it runs on this endpoint.
 
                         // If we have multiple firmware files to be uploaded, do the next one.
-                        if let Some(endpoint) =
-                            find_explored_refreshed_endpoint(state, machine_id, txn).await?
+                        if let Some(endpoint) = find_explored_refreshed_endpoint(
+                            state,
+                            machine_id,
+                            &mut services.db_reader,
+                            pending_db_writes,
+                        )
+                        .await?
                             && let Some(fw_info) =
                                 self.parsed_hosts.find_fw_info_for_host(&endpoint)
                             && let Some(component_info) = fw_info.components.get(firmware_type)
@@ -7537,8 +7694,10 @@ impl HostUpgradeState {
                         tracing::warn!(msg);
 
                         // We need site explorer to requery the version, just in case it actually did get done
-                        db::explored_endpoints::set_waiting_for_explorer_refresh(address, txn)
-                            .await?;
+                        pending_db_writes.push(write_op!(|txn| {
+                            db::explored_endpoints::set_waiting_for_explorer_refresh(address, txn)
+                        }));
+
                         scenario.actual_new_state(
                             HostReprovisionState::FailedFirmwareUpgrade {
                                 firmware_type: *firmware_type,
@@ -7572,8 +7731,13 @@ impl HostUpgradeState {
                 RedfishError::HTTPErrorCode { status_code, .. } => {
                     if status_code == NOT_FOUND {
                         // Dells (maybe others) have been observed to not have report the job any more after completing a host reboot for a UEFI upgrade.  If we get a 404 but see that we're at the right version, we're done with that upgrade.
-                        let Some(endpoint) =
-                            find_explored_refreshed_endpoint(state, machine_id, txn).await?
+                        let Some(endpoint) = find_explored_refreshed_endpoint(
+                            state,
+                            machine_id,
+                            &mut services.db_reader,
+                            pending_db_writes,
+                        )
+                        .await?
                         else {
                             return Ok(None);
                         };
@@ -7628,15 +7792,14 @@ impl HostUpgradeState {
         }
     }
 
-    #[allow(txn_held_across_await)]
     async fn host_reset_for_new_firmware(
         &self,
         state: &ManagedHostStateSnapshot,
-        services: &CommonStateHandlerServices,
+        services: &mut CommonStateHandlerServices,
         machine_id: &MachineId,
         details: &HostReprovisionState,
         scenario: HostFirmwareScenario,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let (
             final_version,
@@ -7668,7 +7831,14 @@ impl HostUpgradeState {
             }
         };
 
-        let Some(endpoint) = find_explored_refreshed_endpoint(state, machine_id, txn).await? else {
+        let Some(endpoint) = find_explored_refreshed_endpoint(
+            state,
+            machine_id,
+            &mut services.db_reader,
+            pending_db_writes,
+        )
+        .await?
+        else {
             tracing::debug!("Waiting for site explorer to revisit {machine_id}");
             return Ok(None);
         };
@@ -7700,7 +7870,7 @@ impl HostUpgradeState {
                             state,
                             services,
                             SystemPowerControl::ForceOff,
-                            txn,
+                            pending_db_writes,
                         )
                         .await?;
 
@@ -7726,7 +7896,7 @@ impl HostUpgradeState {
                         state,
                         services,
                         SystemPowerControl::ACPowercycle,
-                        txn,
+                        pending_db_writes,
                     )
                     .await?;
 
@@ -7746,8 +7916,13 @@ impl HostUpgradeState {
                 }
                 Some(PowerDrainState::Powercycle) => {
                     tracing::info!("Turning back on {}", &endpoint.address);
-                    handler_host_power_control(state, services, SystemPowerControl::On, txn)
-                        .await?;
+                    handler_host_power_control(
+                        state,
+                        services,
+                        SystemPowerControl::On,
+                        pending_db_writes,
+                    )
+                    .await?;
 
                     let delay = if *power_drains_needed < 1000 { 5 } else { 0 };
                     let reprovision_state = HostReprovisionState::ResetForNewFirmware {
@@ -7769,8 +7944,13 @@ impl HostUpgradeState {
                 "Upgrade task has completed for {} but needs reboot, initiating one",
                 &endpoint.address
             );
-            handler_host_power_control(state, services, SystemPowerControl::ForceRestart, txn)
-                .await?;
+            handler_host_power_control(
+                state,
+                services,
+                SystemPowerControl::ForceRestart,
+                pending_db_writes,
+            )
+            .await?;
 
             // Same state but with the rebooted flag set, it can take a long time to reboot in some cases so we do not retry.
         }
@@ -7787,8 +7967,7 @@ impl HostUpgradeState {
                 &endpoint.address
             );
             let redfish_client = services
-                .redfish_client_pool
-                .create_client_from_machine(&state.host_snapshot, txn)
+                .create_redfish_client_from_machine(&state.host_snapshot)
                 .await?;
 
             if let Err(e) = redfish_client.bmc_reset().await {
@@ -7803,8 +7982,7 @@ impl HostUpgradeState {
         {
             // Needs a host power reset.  We might also have used the power drains to do an AC powercycle.
             let redfish_client = services
-                .redfish_client_pool
-                .create_client_from_machine(&state.host_snapshot, txn)
+                .create_redfish_client_from_machine(&state.host_snapshot)
                 .await?;
 
             // We previously possibly tried to use ACPowerycle here, however that requires enough time for the BMC to come back.  We use
@@ -7837,11 +8015,11 @@ impl HostUpgradeState {
     async fn host_new_firmware_reported_wait(
         &self,
         state: &ManagedHostStateSnapshot,
-        services: &CommonStateHandlerServices,
+        services: &mut CommonStateHandlerServices,
         details: &HostReprovisionState,
         machine_id: &MachineId,
         scenario: HostFirmwareScenario,
-        txn: &mut PgConnection,
+        pending_db_writes: &DbWriteBatch,
     ) -> Result<Option<ManagedHostState>, StateHandlerError> {
         let (final_version, firmware_type, firmware_number, previous_reset_time) = match details {
             HostReprovisionState::NewFirmwareReportedWait {
@@ -7862,7 +8040,14 @@ impl HostUpgradeState {
             }
         };
 
-        let Some(endpoint) = find_explored_refreshed_endpoint(state, machine_id, txn).await? else {
+        let Some(endpoint) = find_explored_refreshed_endpoint(
+            state,
+            machine_id,
+            &mut services.db_reader,
+            pending_db_writes,
+        )
+        .await?
+        else {
             tracing::debug!("Waiting for site explorer to revisit {machine_id}");
             return Ok(None);
         };
@@ -7877,10 +8062,8 @@ impl HostUpgradeState {
                 state.managed_state.get_host_repro_retry_count(),
             );
         };
-
-        let current_versions = endpoint.find_all_versions(&fw_info, *firmware_type);
-        if current_versions.is_empty() {
-            tracing::error!("Could no longer find current versions for {machine_id}");
+        let Some(current_version) = endpoint.find_version(&fw_info, *firmware_type) else {
+            tracing::error!("Could no longer find current version for {machine_id}");
             return scenario.actual_new_state(
                 HostReprovisionState::CheckingFirmwareRepeatV2 {
                     firmware_type: Some(*firmware_type),
@@ -7890,16 +8073,7 @@ impl HostUpgradeState {
             );
         };
 
-        let versions_match_final_version = current_versions.iter().all(|v| *v == final_version);
-        if !versions_match_final_version {
-            tracing::warn!(
-                "{}: Not all firmware versions match. Expected: {final_version}, Found: {:?}",
-                endpoint.address,
-                current_versions
-            );
-        };
-
-        if versions_match_final_version {
+        if current_version == final_version {
             // Done waiting, go back to overall checking of version`2s
             tracing::debug!("Done waiting for {machine_id} to reach version");
             scenario.actual_new_state(
@@ -7929,19 +8103,26 @@ impl HostUpgradeState {
                 };
                 return self
                     .host_reset_for_new_firmware(
-                        state, services, machine_id, details, scenario, txn,
+                        state,
+                        services,
+                        machine_id,
+                        details,
+                        scenario,
+                        pending_db_writes,
                     )
                     .await;
             }
             tracing::info!(
-                "Waiting for {machine_id} {firmware_type:?} to reach version {final_version} currently {current_versions:?}"
+                "Waiting for {machine_id} {firmware_type:?} to reach version {final_version} currently {current_version}"
             );
-            db::explored_endpoints::re_explore_if_version_matches(
-                endpoint.address,
-                endpoint.report_version,
-                txn,
-            )
-            .await?;
+
+            pending_db_writes.push(write_op!(|txn| {
+                db::explored_endpoints::re_explore_if_version_matches(
+                    endpoint.address,
+                    endpoint.report_version,
+                    txn,
+                )
+            }));
             Ok(None)
         }
     }
@@ -8058,16 +8239,15 @@ impl AsyncFirmwareUploader {
 async fn handler_restart_dpu(
     machine: &Machine,
     services: &CommonStateHandlerServices,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
 ) -> Result<(), StateHandlerError> {
-    db::machine::update_reboot_requested_time(
-        &machine.id,
+    let machine_id = machine.id;
+    pending_db_writes.push(write_op!(|txn| db::machine::update_reboot_requested_time(
+        &machine_id,
         txn,
         model::machine::MachineLastRebootRequestedMode::Reboot,
-    )
-    .await?;
-
-    restart_dpu(machine, services, txn).await
+    )));
+    restart_dpu(machine, services).await
     //handler_host_power_control(state, services, SystemPowerControl::ForceRestart, txn).await
 }
 
@@ -8437,12 +8617,11 @@ async fn wait_for_boss_controller_job_to_complete(
     }
 }
 
-#[allow(txn_held_across_await)]
 async fn handle_boss_job_failure(
     redfish_client: &dyn Redfish,
     mh_snapshot: &ManagedHostStateSnapshot,
     services: &CommonStateHandlerServices,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let (next_state, expected_power_state) = get_next_state_boss_job_failure(mh_snapshot)?;
 
@@ -8462,7 +8641,7 @@ async fn handle_boss_job_failure(
                     mh_snapshot,
                     services,
                     SystemPowerControl::ForceOff,
-                    txn,
+                    pending_db_writes,
                 )
                 .await?;
 
@@ -8508,8 +8687,13 @@ async fn handle_boss_job_failure(
             }
 
             if current_power_state != libredfish::PowerState::On {
-                handler_host_power_control(mh_snapshot, services, SystemPowerControl::On, txn)
-                    .await?;
+                handler_host_power_control(
+                    mh_snapshot,
+                    services,
+                    SystemPowerControl::On,
+                    pending_db_writes,
+                )
+                .await?;
 
                 return Ok(StateHandlerOutcome::wait(format!(
                     "waiting for {} to power on; current power state: {current_power_state}",
@@ -8530,30 +8714,28 @@ pub fn handler_host_power_control(
     managedhost_snapshot: &ManagedHostStateSnapshot,
     services: &CommonStateHandlerServices,
     action: SystemPowerControl,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
 ) -> impl Future<Output = Result<(), StateHandlerError>> {
     let trigger_location = std::panic::Location::caller();
     handler_host_power_control_with_location(
         managedhost_snapshot,
         services,
         action,
-        txn,
+        pending_db_writes,
         trigger_location,
     )
 }
 
-#[allow(txn_held_across_await)]
 pub async fn handler_host_power_control_with_location(
     managedhost_snapshot: &ManagedHostStateSnapshot,
     services: &CommonStateHandlerServices,
     action: SystemPowerControl,
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     location: &std::panic::Location<'_>,
 ) -> Result<(), StateHandlerError> {
     let mut action = action;
     let redfish_client = services
-        .redfish_client_pool
-        .create_client_from_machine(&managedhost_snapshot.host_snapshot, txn)
+        .create_redfish_client_from_machine(&managedhost_snapshot.host_snapshot)
         .await?;
 
     let power_state = host_power_state(redfish_client.as_ref()).await?;
@@ -8581,7 +8763,7 @@ pub async fn handler_host_power_control_with_location(
             &managedhost_snapshot.host_snapshot,
             action,
             services.ipmi_tool.clone(),
-            txn,
+            pending_db_writes,
             location,
         )
         .await
@@ -8601,23 +8783,21 @@ pub async fn handler_host_power_control_with_location(
 
     if should_update_dpu_timestamp {
         for dpu_snapshot in &managedhost_snapshot.dpu_snapshots {
-            db::machine::update_reboot_requested_time(&dpu_snapshot.id, txn, action.into()).await?;
+            let dpu_id = dpu_snapshot.id;
+            pending_db_writes.push(write_op!(|txn| {
+                db::machine::update_reboot_requested_time(&dpu_id, txn, action.into())
+            }));
         }
     }
 
     Ok(())
 }
 
-#[allow(txn_held_across_await)]
 async fn restart_dpu(
     machine: &Machine,
     services: &CommonStateHandlerServices,
-    txn: &mut PgConnection,
 ) -> Result<(), StateHandlerError> {
-    let dpu_redfish_client = services
-        .redfish_client_pool
-        .create_client_from_machine(machine, txn)
-        .await?;
+    let dpu_redfish_client = services.create_redfish_client_from_machine(machine).await?;
 
     // We have seen the boot order be reset on DPUs in some edge cases (for example, after upgrading the BMC and CEC on BF3s)
     // This should take care of handling such cases. It is a no-op most of the time
@@ -8650,7 +8830,8 @@ async fn restart_dpu(
 pub async fn find_explored_refreshed_endpoint(
     state: &ManagedHostStateSnapshot,
     machine_id: &MachineId,
-    txn: &mut PgConnection,
+    db_reader: &mut PgPoolReader,
+    pending_db_writes: &DbWriteBatch,
 ) -> Result<Option<ExploredEndpoint>, StateHandlerError> {
     let addr: IpAddr = state
         .host_snapshot
@@ -8658,7 +8839,7 @@ pub async fn find_explored_refreshed_endpoint(
         .ip_addr()
         .map_err(StateHandlerError::GenericError)?;
 
-    let endpoint = db::explored_endpoints::find_by_ips(&mut *txn, vec![addr]).await?;
+    let endpoint = db::explored_endpoints::find_by_ips(db_reader, vec![addr]).await?;
     let endpoint = endpoint
         .into_iter()
         .next()
@@ -8668,12 +8849,13 @@ pub async fn find_explored_refreshed_endpoint(
 
     if endpoint.waiting_for_explorer_refresh {
         // In the cases where this was called, we care about prompt updates, so poke site explorer to revisit this endpoint next time it runs
-        db::explored_endpoints::re_explore_if_version_matches(
-            endpoint.address,
-            endpoint.report_version,
-            txn,
-        )
-        .await?;
+        pending_db_writes.push(write_op!(|txn| {
+            db::explored_endpoints::re_explore_if_version_matches(
+                endpoint.address,
+                endpoint.report_version,
+                txn,
+            )
+        }));
         return Ok(None);
     }
     Ok(Some(endpoint))
@@ -8783,9 +8965,8 @@ async fn is_machine_validation_requested(state: &ManagedHostStateSnapshot) -> bo
     on_demand_machine_validation_request
 }
 
-#[allow(txn_held_across_await)]
 async fn handle_instance_host_platform_config(
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     mh_snapshot: &mut ManagedHostStateSnapshot,
     reachability_params: &ReachabilityParams,
@@ -8793,8 +8974,7 @@ async fn handle_instance_host_platform_config(
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let redfish_client = ctx
         .services
-        .redfish_client_pool
-        .create_client_from_machine(&mh_snapshot.host_snapshot, txn)
+        .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
         .await?;
 
     let instance_state = match platform_config_state {
@@ -8827,7 +9007,7 @@ async fn handle_instance_host_platform_config(
                     &mh_snapshot.host_snapshot,
                     SystemPowerControl::ForceOff,
                     ctx.services.ipmi_tool.clone(),
-                    txn,
+                    pending_db_writes,
                 )
                 .await
                 .map_err(|e| {
@@ -8874,7 +9054,7 @@ async fn handle_instance_host_platform_config(
                 &mh_snapshot.host_snapshot,
                 SystemPowerControl::On,
                 ctx.services.ipmi_tool.clone(),
-                txn,
+                pending_db_writes,
             )
             .await
             .map_err(|e| {
@@ -8898,7 +9078,7 @@ async fn handle_instance_host_platform_config(
                     mh_snapshot,
                     reachability_params,
                     ctx.services,
-                    txn,
+                    pending_db_writes,
                 )
                 .await
                 {
@@ -8972,7 +9152,7 @@ async fn handle_instance_host_platform_config(
         }
         HostPlatformConfigurationState::ConfigureBios => {
             match configure_host_bios(
-                txn,
+                pending_db_writes,
                 ctx,
                 reachability_params,
                 redfish_client.as_ref(),
@@ -9057,7 +9237,7 @@ async fn handle_instance_host_platform_config(
             set_boot_order_info,
         } => {
             match set_host_boot_order(
-                txn,
+                pending_db_writes,
                 ctx,
                 reachability_params,
                 redfish_client.as_ref(),
@@ -9099,9 +9279,8 @@ async fn handle_instance_host_platform_config(
     Ok(StateHandlerOutcome::transition(next_state))
 }
 
-#[allow(txn_held_across_await)]
 async fn configure_host_bios(
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     reachability_params: &ReachabilityParams,
     redfish_client: &dyn Redfish,
@@ -9123,6 +9302,11 @@ async fn configure_host_bios(
     } else {
         // This is the Zero-DPU case
         None
+    };
+
+    let power_control_action = match mh_snapshot.host_snapshot.bmc_vendor() {
+        bmc_vendor::BMCVendor::Nvidia => SystemPowerControl::GracefulRestart,
+        _ => SystemPowerControl::ForceRestart,
     };
 
     if let Err(e) = call_machine_setup_and_handle_no_dpu_error(
@@ -9151,8 +9335,8 @@ async fn configure_host_bios(
             handler_host_power_control(
                 mh_snapshot,
                 ctx.services,
-                SystemPowerControl::ForceRestart,
-                txn,
+                power_control_action,
+                pending_db_writes,
             )
             .await?;
 
@@ -9167,7 +9351,7 @@ async fn configure_host_bios(
                 None,
                 reachability_params,
                 ctx.services,
-                txn,
+                pending_db_writes,
             )
             .await?
         };
@@ -9183,16 +9367,15 @@ async fn configure_host_bios(
     handler_host_power_control(
         mh_snapshot,
         ctx.services,
-        SystemPowerControl::ForceRestart,
-        txn,
+        power_control_action,
+        pending_db_writes,
     )
     .await?;
     Ok(BiosConfigOutcome::Done)
 }
 
-#[allow(txn_held_across_await)]
 async fn set_host_boot_order(
-    txn: &mut PgConnection,
+    pending_db_writes: &DbWriteBatch,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     reachability_params: &ReachabilityParams,
     redfish_client: &dyn Redfish,
@@ -9233,13 +9416,18 @@ async fn set_host_boot_order(
                             e
                         );
 
+                        let power_control_action = match mh_snapshot.host_snapshot.bmc_vendor() {
+                            bmc_vendor::BMCVendor::Nvidia => SystemPowerControl::GracefulRestart,
+                            _ => SystemPowerControl::ForceRestart,
+                        };
+
                         let reboot_status =
                             if mh_snapshot.host_snapshot.last_reboot_requested.is_none() {
                                 handler_host_power_control(
                                     mh_snapshot,
                                     ctx.services,
-                                    SystemPowerControl::ForceRestart,
-                                    txn,
+                                    power_control_action,
+                                    pending_db_writes,
                                 )
                                 .await?;
 
@@ -9254,7 +9442,7 @@ async fn set_host_boot_order(
                                     None,
                                     reachability_params,
                                     ctx.services,
-                                    txn,
+                                    pending_db_writes,
                                 )
                                 .await?
                             };
@@ -9298,12 +9486,17 @@ async fn set_host_boot_order(
             }))
         }
         SetBootOrderState::RebootHost => {
+            let power_control_action = match mh_snapshot.host_snapshot.bmc_vendor() {
+                bmc_vendor::BMCVendor::Nvidia => SystemPowerControl::GracefulRestart,
+                _ => SystemPowerControl::ForceRestart,
+            };
+
             // Host needs to be rebooted to pick up the changes after calling machine_setup
             handler_host_power_control(
                 mh_snapshot,
                 ctx.services,
-                SystemPowerControl::ForceRestart,
-                txn,
+                power_control_action,
+                pending_db_writes,
             )
             .await?;
 

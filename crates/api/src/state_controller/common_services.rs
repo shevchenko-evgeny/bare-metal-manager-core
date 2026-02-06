@@ -17,6 +17,9 @@
 
 use std::sync::Arc;
 
+use db::db_read::PgPoolReader;
+use libredfish::Redfish;
+use model::machine::Machine;
 use model::resource_pool::common::IbPools;
 use sqlx::PgPool;
 
@@ -26,12 +29,17 @@ use crate::ib::IBFabricManager;
 use crate::ipmitool::IPMITool;
 use crate::rack::rms_client::RmsApi;
 use crate::redfish::RedfishClientPool;
+use crate::state_controller::state_handler::StateHandlerError;
 
 /// Services that are accessible to all statehandlers within carbide-core
 #[derive(Clone)]
 pub struct CommonStateHandlerServices {
     /// Postgres database pool
     pub db_pool: PgPool,
+
+    /// Postgres database pool that can be passed directly to read-only db functions without a
+    /// transaction
+    pub db_reader: PgPoolReader,
 
     /// API for interaction with Libredfish
     pub redfish_client_pool: Arc<dyn RedfishClientPool>,
@@ -54,4 +62,16 @@ pub struct CommonStateHandlerServices {
     /// Optional for now, but will be required in the future.
     #[allow(dead_code)]
     pub rms_client: Option<Arc<dyn RmsApi>>,
+}
+
+impl CommonStateHandlerServices {
+    pub async fn create_redfish_client_from_machine(
+        &self,
+        machine: &Machine,
+    ) -> Result<Box<dyn Redfish>, StateHandlerError> {
+        Ok(self
+            .redfish_client_pool
+            .create_client_from_machine(machine, &self.db_pool)
+            .await?)
+    }
 }

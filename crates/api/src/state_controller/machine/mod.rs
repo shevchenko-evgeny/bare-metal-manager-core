@@ -27,11 +27,11 @@ use model::attestation::EkCertVerificationStatus;
 use model::machine::{
     FailureCause, FailureDetails, FailureSource, MeasuringState, StateMachineArea,
 };
-use sqlx::PgConnection;
 
 use super::state_handler::StateHandlerError;
 
 pub mod context;
+pub mod db_write_batch;
 pub mod handler;
 pub mod io;
 pub mod metrics;
@@ -58,10 +58,13 @@ pub fn extra_logfmt_logging_fields() -> Vec<String> {
 /// ComposedState type of thing where I can join across the journal
 /// and bundle to do a single query + return a single ComposedState
 /// that has everything I want.
-async fn get_measurement_failure_cause(
-    txn: &mut PgConnection,
+async fn get_measurement_failure_cause<DB>(
+    txn: &mut DB,
     machine_id: &MachineId,
-) -> Result<FailureCause, StateHandlerError> {
+) -> Result<FailureCause, StateHandlerError>
+where
+    for<'db> &'db mut DB: DbReader<'db>,
+{
     let (_, ek_cert_status) = get_measuring_prerequisites(machine_id, txn).await?;
     if !ek_cert_status.signing_ca_found {
         return Ok(FailureCause::MeasurementsCAValidationFailed {
@@ -133,12 +136,15 @@ where
     Ok((machine_state, ek_cert_verification_status))
 }
 
-pub(crate) async fn handle_measuring_state(
+pub(crate) async fn handle_measuring_state<DB>(
     measuring_state: &MeasuringState,
     machine_id: &MachineId,
-    txn: &mut PgConnection,
+    txn: &mut DB,
     attestation_enabled: bool,
-) -> Result<MeasuringOutcome, StateHandlerError> {
+) -> Result<MeasuringOutcome, StateHandlerError>
+where
+    for<'db> &'db mut DB: DbReader<'db>,
+{
     if !attestation_enabled {
         return Ok(MeasuringOutcome::PassedOk);
     }

@@ -1492,9 +1492,7 @@ impl PreingestionManagerStatic {
         let upgrade_script_state = self.upgrade_script_state.clone();
         let (username, password) = if let Some(credential_provider) = &self.credential_provider {
             // We need to backtrack from the IP address to get the MAC address, which is what the credentials database is keyed on
-            let interface = db
-                .with_txn(|txn| db::machine_interface::find_by_ip(txn, endpoint_address).boxed())
-                .await??;
+            let interface = db::machine_interface::find_by_ip(db, endpoint_address).await?;
             let Some(interface) = interface else {
                 tracing::warn!(
                     "Unable to run update script for {address}: MAC address not retrievable"
