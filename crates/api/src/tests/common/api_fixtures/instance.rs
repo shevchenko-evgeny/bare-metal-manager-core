@@ -153,7 +153,7 @@ type Txn<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
 impl<'a, 'b> TestInstance<'a, 'b> {
     pub async fn db_instance(&self, txn: &mut Txn<'_>) -> InstanceSnapshot {
-        db::instance::find_by_id(txn, self.id)
+        db::instance::find_by_id(txn.as_mut(), self.id)
             .await
             .unwrap()
             .unwrap()
@@ -365,6 +365,7 @@ pub async fn advance_created_instance_into_state(
     env.run_machine_state_controller_iteration().await;
     env.run_ib_fabric_monitor_iteration().await;
     env.run_ib_fabric_monitor_iteration().await;
+    env.run_nvl_partition_monitor_iteration().await;
     env.run_nvl_partition_monitor_iteration().await;
     env.run_nvl_partition_monitor_iteration().await;
     super::simulate_hardware_health_report(

@@ -38,24 +38,35 @@ pub struct EmbeddedNic {
 }
 
 impl DellPowerEdgeR750<'_> {
+    fn sensor_layout() -> redfish::sensor::Layout {
+        redfish::sensor::Layout {
+            temperature: 10,
+            fan: 10,
+            power: 20,
+            current: 10,
+        }
+    }
+
     pub fn manager_config(&self) -> redfish::manager::Config {
         redfish::manager::Config {
-            id: "iDRAC.Embedded.1",
-            eth_interfaces: vec![
-                redfish::ethernet_interface::builder(
-                    &redfish::ethernet_interface::manager_resource("iDRAC.Embedded.1", "NIC.1"),
-                )
-                .mac_address(self.bmc_mac_address)
-                .interface_enabled(true)
-                .build(),
-            ],
-            firmware_version: "6.00.30.00",
+            managers: vec![redfish::manager::SingleConfig {
+                id: "iDRAC.Embedded.1",
+                eth_interfaces: vec![
+                    redfish::ethernet_interface::builder(
+                        &redfish::ethernet_interface::manager_resource("iDRAC.Embedded.1", "NIC.1"),
+                    )
+                    .mac_address(self.bmc_mac_address)
+                    .interface_enabled(true)
+                    .build(),
+                ],
+                firmware_version: "6.00.30.00",
+            }],
         }
     }
 
     pub fn system_config(&self, pc: Arc<dyn PowerControl>) -> redfish::computer_system::Config {
         let power_control = Some(pc);
-        let serial_number = self.product_serial_number.to_string().into();
+        let serial_number = Some(self.product_serial_number.to_string().into());
         let system_id = "System.Embedded.1";
 
         let eth_interfaces = [
@@ -107,14 +118,14 @@ impl DellPowerEdgeR750<'_> {
                 id: Cow::Borrowed(system_id),
                 manufacturer: Some("Dell Inc.".into()),
                 model: Some("PowerEdge R750".into()),
-                eth_interfaces,
+                eth_interfaces: Some(eth_interfaces),
                 serial_number,
                 boot_order_mode: redfish::computer_system::BootOrderMode::DellOem,
                 power_control,
                 chassis: vec!["System.Embedded.1".into()],
-                boot_options,
+                boot_options: Some(boot_options),
                 bios_mode: redfish::computer_system::BiosMode::DellOem,
-                base_bios: redfish::bios::builder(&redfish::bios::resource(system_id))
+                base_bios: Some(redfish::bios::builder(&redfish::bios::resource(system_id))
                     .attributes(json!({
                         "BootSeqRetry": "Disabled",
                         "SetBootOrderEn": "NIC.HttpDevice.1-1,Disk.Bay.2:Enclosure.Internal.0-1",
@@ -133,7 +144,7 @@ impl DellPowerEdgeR750<'_> {
                         "PxeDev1EnDis": "Disabled",
                         "HttpDev1Interface": "NIC.Slot.5-1",
                     }))
-                    .build(),
+                    .build()),
             }],
         }
     }
@@ -199,12 +210,17 @@ impl DellPowerEdgeR750<'_> {
         redfish::chassis::ChassisConfig {
             chassis: vec![redfish::chassis::SingleChassisConfig {
                 id: Cow::Borrowed(chassis_id),
+                chassis_type: "RackMount".into(),
                 manufacturer: Some("Dell Inc.".into()),
                 part_number: Some("01J4WFA05".into()),
                 model: Some("PowerEdge R750".into()),
                 serial_number: Some(self.product_serial_number.to_string().into()),
                 network_adapters: Some(network_adapters),
                 pcie_devices: Some(pcie_devices),
+                sensors: Some(redfish::sensor::generate_chassis_sensors(
+                    chassis_id,
+                    Self::sensor_layout(),
+                )),
             }],
         }
     }

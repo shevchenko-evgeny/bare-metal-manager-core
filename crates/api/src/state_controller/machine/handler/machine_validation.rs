@@ -14,8 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use db::{self, WithTransaction};
-use futures_util::FutureExt;
 use libredfish::SystemPowerControl;
 use model::machine::{
     FailureCause, MachineState, MachineValidatingState, ManagedHostState, ManagedHostStateSnapshot,
@@ -52,12 +50,10 @@ pub(crate) async fn handle_machine_validation_state(
                 pending_db_writes,
             )
             .await?;
-            let machine_validation = ctx
-                .services
-                .db_pool
-                .with_txn(|txn| db::machine_validation::find_by_id(txn, validation_id).boxed())
-                .await?
-                .map_err(|err| StateHandlerError::GenericError(err.into()))?;
+            let machine_validation =
+                db::machine_validation::find_by_id(&mut ctx.services.db_reader, validation_id)
+                    .await
+                    .map_err(|err| StateHandlerError::GenericError(err.into()))?;
 
             let next_state = ManagedHostState::Validation {
                 validation_state: ValidationState::MachineValidation {
@@ -114,12 +110,10 @@ pub(crate) async fn handle_machine_validation_state(
                         },
                     )
                 }));
-                let machine_validation = ctx
-                    .services
-                    .db_pool
-                    .with_txn(|txn| db::machine_validation::find_by_id(txn, id).boxed())
-                    .await?
-                    .map_err(|err| StateHandlerError::GenericError(err.into()))?;
+                let machine_validation =
+                    db::machine_validation::find_by_id(&mut ctx.services.db_reader, id)
+                        .await
+                        .map_err(|err| StateHandlerError::GenericError(err.into()))?;
 
                 *ctx.metrics
                     .last_machine_validation_list
@@ -148,12 +142,10 @@ pub(crate) async fn handle_machine_validation_state(
                         "{} machine validation completed",
                         mh_snapshot.host_snapshot.id
                     );
-                    let machine_validation = ctx
-                        .services
-                        .db_pool
-                        .with_txn(|txn| db::machine_validation::find_by_id(txn, id).boxed())
-                        .await?
-                        .map_err(|err| StateHandlerError::GenericError(err.into()))?;
+                    let machine_validation =
+                        db::machine_validation::find_by_id(&mut ctx.services.db_reader, id)
+                            .await
+                            .map_err(|err| StateHandlerError::GenericError(err.into()))?;
                     let status = machine_validation.status.clone().unwrap_or_default();
                     *ctx.metrics
                         .last_machine_validation_list
@@ -204,32 +196,28 @@ pub(crate) async fn handle_machine_validation_requested(
                 db::machine::clear_failure_details(&machine_id, txn)
             }));
         }
-        let machine_validation = match services
-            .db_pool
-            .with_txn(|txn| {
-                db::machine_validation::find_active_machine_validation_by_machine_id(
-                    txn,
-                    &mh_snapshot.host_snapshot.id,
-                )
-                .boxed()
-            })
-            .await?
-        {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "find_active_machine_validation_by_machine_id"
-                );
-                let machine_id = mh_snapshot.host_snapshot.id;
-                pending_db_writes.push(write_op!(|txn| {
-                    db::machine::set_machine_validation_request(txn, &machine_id, true)
-                }));
-                // Health Alert ?
-                // Rare screnario, if something googfed up in DB
-                return Ok(Some(StateHandlerOutcome::do_nothing()));
-            }
-        };
+        let machine_validation =
+            match db::machine_validation::find_active_machine_validation_by_machine_id(
+                &services.db_pool,
+                &mh_snapshot.host_snapshot.id,
+            )
+            .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::info!(
+                        error = %e,
+                        "find_active_machine_validation_by_machine_id"
+                    );
+                    let machine_id = mh_snapshot.host_snapshot.id;
+                    pending_db_writes.push(write_op!(|txn| {
+                        db::machine::set_machine_validation_request(txn, &machine_id, true)
+                    }));
+                    // Health Alert ?
+                    // Rare screnario, if something googfed up in DB
+                    return Ok(Some(StateHandlerOutcome::do_nothing()));
+                }
+            };
 
         let next_state = ManagedHostState::Validation {
             validation_state: ValidationState::MachineValidation {

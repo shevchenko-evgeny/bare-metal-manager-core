@@ -59,20 +59,20 @@ pub fn extra_logfmt_logging_fields() -> Vec<String> {
 /// and bundle to do a single query + return a single ComposedState
 /// that has everything I want.
 async fn get_measurement_failure_cause<DB>(
-    txn: &mut DB,
+    db: &mut DB,
     machine_id: &MachineId,
 ) -> Result<FailureCause, StateHandlerError>
 where
     for<'db> &'db mut DB: DbReader<'db>,
 {
-    let (_, ek_cert_status) = get_measuring_prerequisites(machine_id, txn).await?;
+    let (_, ek_cert_status) = get_measuring_prerequisites(machine_id, &mut *db).await?;
     if !ek_cert_status.signing_ca_found {
         return Ok(FailureCause::MeasurementsCAValidationFailed {
             err: "Measuremets CA Validation Failed".to_string(),
         });
     }
 
-    let state = get_measurement_bundle_state(txn, machine_id)
+    let state = get_measurement_bundle_state(db, machine_id)
         .await
         .map_err(StateHandlerError::GenericError)?
         .ok_or(StateHandlerError::MissingData {
@@ -139,7 +139,7 @@ where
 pub(crate) async fn handle_measuring_state<DB>(
     measuring_state: &MeasuringState,
     machine_id: &MachineId,
-    txn: &mut DB,
+    db: &mut DB,
     attestation_enabled: bool,
 ) -> Result<MeasuringOutcome, StateHandlerError>
 where
@@ -149,7 +149,7 @@ where
         return Ok(MeasuringOutcome::PassedOk);
     }
     let (machine_state, ek_cert_verification_status) =
-        get_measuring_prerequisites(machine_id, txn).await?;
+        get_measuring_prerequisites(machine_id, &mut *db).await?;
 
     if !ek_cert_verification_status.signing_ca_found {
         return Ok(MeasuringOutcome::Unsuccessful((
@@ -187,7 +187,7 @@ where
                 MeasurementMachineState::Measured => MeasuringOutcome::PassedOk,
                 MeasurementMachineState::MeasuringFailed => MeasuringOutcome::Unsuccessful((
                     FailureDetails {
-                        cause: get_measurement_failure_cause(txn, machine_id).await?,
+                        cause: get_measurement_failure_cause(db, machine_id).await?,
                         failed_at: chrono::Utc::now(),
                         source: FailureSource::StateMachineArea(StateMachineArea::Default),
                     },
@@ -215,7 +215,7 @@ where
                 MeasurementMachineState::Measured => MeasuringOutcome::PassedOk,
                 MeasurementMachineState::MeasuringFailed => MeasuringOutcome::Unsuccessful((
                     FailureDetails {
-                        cause: get_measurement_failure_cause(txn, machine_id).await?,
+                        cause: get_measurement_failure_cause(db, machine_id).await?,
                         failed_at: chrono::Utc::now(),
                         source: FailureSource::StateMachineArea(StateMachineArea::Default),
                     },

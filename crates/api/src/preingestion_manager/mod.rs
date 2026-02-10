@@ -177,11 +177,9 @@ impl PreingestionManager {
             }
         };
 
-        let items = db
-            .with_txn(|txn| {
-                db::explored_endpoints::find_preingest_not_waiting_not_error(txn).boxed()
-            })
-            .await??;
+        let items = db::explored_endpoints::find_preingest_not_waiting_not_error(&db)
+            .boxed()
+            .await?;
 
         if !items.is_empty() && items.len() < 3 {
             // Show states if a modest amount, just count otherwise
@@ -234,16 +232,13 @@ impl PreingestionManager {
             }
         }
 
-        let mut conn = db.acquire().await.map_err(DatabaseError::acquire)?;
-
         metrics.machines_in_preingestion =
-            db::explored_endpoints::find_preingest_not_waiting_not_error(&mut conn)
+            db::explored_endpoints::find_preingest_not_waiting_not_error(&db)
                 .await?
                 .len();
-        metrics.waiting_for_installation =
-            db::explored_endpoints::find_preingest_installing(&mut conn)
-                .await?
-                .len();
+        metrics.waiting_for_installation = db::explored_endpoints::find_preingest_installing(&db)
+            .await?
+            .len();
 
         tracing::debug!(
             "Preingestion metrics: in_preingestion {} waiting {} delayed {}",

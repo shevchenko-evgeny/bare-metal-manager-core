@@ -28,6 +28,7 @@ use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Duration, Utc};
 use config_version::{ConfigVersion, Versioned};
 use db::db_read::PgPoolReader;
+use db::machine::mark_machine_ingestion_done_with_dpf;
 use eyre::eyre;
 use forge_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialProvider, Credentials,
@@ -3372,7 +3373,16 @@ impl DpuMachineStateHandler {
 
                 // Checking dpf and updating state to start dpf based provisioing in this satte because this state works as a sync state as well.
                 let next_state =
-                    if dpf_based_dpu_provisioning_possible(state, self.dpf_config.enabled) {
+                    if dpf_based_dpu_provisioning_possible(state, self.dpf_config.enabled, false) {
+                        let host_snapshot_id = state.host_snapshot.id;
+                        self.pending_db_writes.push(write_op!(|txn| {
+                            mark_machine_ingestion_done_with_dpf(txn, &host_snapshot_id)
+                        }));
+                        for dpu_id in state.dpu_snapshots.iter().map(|d| d.id) {
+                            self.pending_db_writes.push(write_op!(|txn| {
+                                mark_machine_ingestion_done_with_dpf(txn, &dpu_id)
+                            }));
+                        }
                         DpuInitState::DpfStates {
                             state: model::machine::DpfState::CreateDpuDevice,
                         }

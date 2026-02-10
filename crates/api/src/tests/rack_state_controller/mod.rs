@@ -163,8 +163,7 @@ async fn test_rack_deletion_flow(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
     let _rack = create_test_rack(&pool, rack_id).await?;
 
     // Verify rack exists
-    let mut txn = pool.acquire().await?;
-    let rack = db_rack::get(&mut txn, rack_id).await?;
+    let rack = db_rack::get(&pool, rack_id).await?;
     assert_eq!(rack.id, rack_id);
 
     // Start the state controller to process the rack while it's active
@@ -337,8 +336,7 @@ async fn test_rack_state_transition_validation(
         set_rack_controller_state(pool.acquire().await?.as_mut(), rack_id, state.clone()).await?;
 
         // Verify the state was set correctly
-        let mut txn = pool.acquire().await?;
-        let rack = db_rack::get(&mut txn, rack_id).await?;
+        let rack = db_rack::get(&pool, rack_id).await?;
         assert!(matches!(rack.controller_state.value, _ if rack.controller_state.value == state));
     }
 

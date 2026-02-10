@@ -31,6 +31,7 @@ use carbide_uuid::machine::MachineId;
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::vpc::VpcId;
 use chrono::{DateTime, Duration, Utc};
+use db::db_read::PgPoolReader;
 use db::instance_type::create as create_instance_type;
 use db::network_security_group::create as create_network_security_group;
 use db::work_lock_manager;
@@ -256,6 +257,7 @@ pub struct TestEnvOverrides {
     pub network_segments_drain_period: Option<chrono::Duration>,
     pub power_manager_enabled: Option<bool>,
     pub dpf_config: Option<DpfConfig>,
+    pub nmxm_default_partition: Option<bool>,
 }
 
 impl TestEnvOverrides {
@@ -862,6 +864,10 @@ impl TestEnv {
             .await
             .unwrap();
     }
+
+    pub fn db_reader(&self) -> PgPoolReader {
+        self.pool.clone().into()
+    }
 }
 
 fn dpu_fw_example() -> HashMap<String, Firmware> {
@@ -1228,7 +1234,12 @@ pub async fn create_test_env_with_overrides(
     populate_default_credentials(credential_provider.as_ref()).await;
     let certificate_provider = Arc::new(TestCertificateProvider::new());
     let redfish_sim = Arc::new(RedfishSim::default());
-    let nmxm_sim: Arc<dyn NmxmClientPool> = Arc::new(NmxmSimClient::default());
+    let nmxm_sim: Arc<dyn NmxmClientPool> =
+        Arc::new(if overrides.nmxm_default_partition == Some(true) {
+            NmxmSimClient::with_default_partition()
+        } else {
+            NmxmSimClient::default()
+        });
 
     let mut config = overrides.config.unwrap_or(get_config());
     if let Some(threshold) = overrides.dpu_agent_version_staleness_threshold {
@@ -2475,7 +2486,7 @@ pub async fn update_machine_validation_run(
 }
 
 pub async fn get_vpc_fixture_id(env: &TestEnv) -> VpcId {
-    db::vpc::find_by_name(&mut env.pool.begin().await.unwrap(), "test vpc 1")
+    db::vpc::find_by_name(&env.pool, "test vpc 1")
         .await
         .unwrap()
         .into_iter()
