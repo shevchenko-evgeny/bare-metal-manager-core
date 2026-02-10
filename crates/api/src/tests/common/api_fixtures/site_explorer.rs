@@ -1536,11 +1536,11 @@ pub async fn new_power_shelfs(env: &TestEnv, count: u32) -> eyre::Result<Vec<Pow
     Ok(power_shelf_ids)
 }
 
-#[allow(dead_code)]
 pub struct TestRackDbBuilder {
     compute_trays: Vec<MachineId>,
     power_shelves: Vec<PowerShelfId>,
-    switches: Vec<SwitchId>,
+    // TODO: unhide this when we have machine-a-tron support for switch
+    _switches: Vec<SwitchId>,
     expected_compute_trays: Vec<MacAddress>,
     expected_power_shelves: Vec<MacAddress>,
     expected_switches: Vec<MacAddress>,
@@ -1552,7 +1552,8 @@ impl Default for TestRackDbBuilder {
         TestRackDbBuilder {
             compute_trays: vec![],
             power_shelves: vec![],
-            switches: vec![],
+            // TODO: unhide this when we have machine-a-tron support for switch
+            _switches: vec![],
             expected_compute_trays: vec![],
             expected_power_shelves: vec![],
             expected_switches: vec![],
@@ -1561,7 +1562,6 @@ impl Default for TestRackDbBuilder {
     }
 }
 
-#[allow(dead_code)]
 impl TestRackDbBuilder {
     pub fn new() -> TestRackDbBuilder {
         TestRackDbBuilder {
@@ -1574,18 +1574,24 @@ impl TestRackDbBuilder {
         self
     }
 
-    pub fn with_compute_trays(mut self, compute_trays: Vec<MachineId>) -> Self {
+    // TODO: unhide this when we have a test that prefills the discovered
+    // compute trays  
+    pub fn _with_compute_trays(mut self, compute_trays: Vec<MachineId>) -> Self {
         self.compute_trays = compute_trays;
         self
     }
 
-    pub fn with_power_shelves(mut self, power_shelves: Vec<PowerShelfId>) -> Self {
+    // TODO: unhide this when we have a test that prefills the discovered
+    // power shelfs
+    pub fn _with_power_shelves(mut self, power_shelves: Vec<PowerShelfId>) -> Self {
         self.power_shelves = power_shelves;
         self
     }
 
-    pub fn with_switches(mut self, switches: Vec<SwitchId>) -> Self {
-        self.switches = switches;
+    // TODO: unhide this when we have a test that prefills the discovered
+    // switches
+    pub fn _with_switches(mut self, switches: Vec<SwitchId>) -> Self {
+        self._switches = switches;
         self
     }
 
@@ -1605,7 +1611,9 @@ impl TestRackDbBuilder {
         self
     }
 
-    pub fn with_expected_switches(mut self, expected_switches: Vec<[u8; 6]>) -> Self {
+    // TODO: unhide this when we have a test that sets expected switches (presumably, but
+    // not necessarily when machine-a-tron supports switches)
+    pub fn _with_expected_switches(mut self, expected_switches: Vec<[u8; 6]>) -> Self {
         self.expected_switches = expected_switches.into_iter().map(MacAddress::new).collect();
         self
     }
@@ -1636,7 +1644,6 @@ impl TestRackDbBuilder {
 }
 
 /// Creates a new switch for testing purposes
-#[allow(dead_code)]
 pub async fn new_switch(
     env: &TestEnv,
     name: Option<String>,
