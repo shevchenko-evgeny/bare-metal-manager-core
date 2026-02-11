@@ -47,9 +47,9 @@ pub(crate) async fn cleanup_machine_completed(
     let (machine, mut txn) = api
         .load_machine(&machine_id, MachineSearchConfig::default())
         .await?;
-    db::machine::update_cleanup_time(&machine, &mut txn).await?;
 
-    if let Some(nvme_result) = cleanup_info.nvme
+    // Check if cleanup failed
+    let cleanup_failed = if let Some(nvme_result) = cleanup_info.nvme
         && rpc::machine_cleanup_info::CleanupResult::Error as i32 == nvme_result.result
     {
         // NVME Cleanup failed. Move machine to failed state.
@@ -65,6 +65,14 @@ pub(crate) async fn cleanup_machine_completed(
             },
         )
         .await?;
+        true
+    } else {
+        false
+    };
+
+    // Only update cleanup time if cleanup succeeded
+    if !cleanup_failed {
+        db::machine::update_cleanup_time(&machine, &mut txn).await?;
     }
 
     txn.commit().await?;
